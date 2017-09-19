@@ -14,9 +14,7 @@ type VoiceConfig struct {
 	QueueLength int `toml:"queue_length"`
 	SendTimeout int `toml:"send_timeout"`
 	IdleTimeout int `toml:"afk_timeout"`
-	Pausable    bool
-	Stoppable   bool
-	Skippable   bool
+	Broadcast bool
 }
 
 var DefaultConfig = VoiceConfig{
@@ -72,7 +70,7 @@ type Sends struct {
 }
 
 // Connect launches a goroutine that dispatches voice to a discord guild
-// Queue
+// Sends
 // Close
 // Since discord allows only one voice connection per guild, you should call close before calling connect again for the same guild
 func Connect(s *discordgo.Session, guildID string, idleChannelID string, opts ...VoiceOption) (Sends, func()) {
@@ -211,12 +209,19 @@ func sendPayload(recv receives, p *Payload, vc *discordgo.VoiceConnection, sendT
 	if !p.DCAEncoded {
 		encoder, err := dca.EncodeMem(p.Reader, &defaultEncodeOptions)
 		if err != nil {
+			log.Printf("error encoding audio %v", err)
 			return
 		}
 		defer encoder.Cleanup()
 		reader = encoder
 	}
 	opusReader := dca.NewDecoder(reader)
+	err = opusReader.ReadMetadata()
+	if err != nil {
+		log.Printf("metadata %#v", opusReader.Metadata)
+	} else {
+		log.Printf("no metadata :(")
+	}
 	vc.Speaking(true)
 	defer vc.Speaking(false)
 	for {
