@@ -25,11 +25,19 @@ var DefaultConfig = VoiceConfig{
 	IdleTimeout: 300,
 }
 
+type Control uint8
+
+const (
+	nop Control = iota
+	Skip
+	Pause
+)
+
 // Payload
 type Payload struct {
-	Name      string
-	ChannelID string
-	Reader    io.Reader
+	DCAEncoded bool
+	ChannelID  string
+	Reader     io.Reader
 }
 
 type VoiceOption func(*VoiceConfig)
@@ -58,43 +66,20 @@ func IdleTimeout(n int) VoiceOption {
 	}
 }
 
-func Pausable(b bool) VoiceOption {
-	return func(cfg *VoiceConfig) {
-		cfg.Pausable = b
-	}
+type Sends struct {
+	Queue   chan<- *Payload
+	Control chan<- Control
 }
-
-func Stoppable(b bool) VoiceOption {
-	return func(cfg *VoiceConfig) {
-		cfg.Stoppable = b
-	}
-}
-
-func Skippable(b bool) VoiceOption {
-	return func(cfg *VoiceConfig) {
-		cfg.Skippable = b
-	}
-}
-
-type Senders struct {
-	Queue chan<- *Payload
-	Skip  chan<- struct{}
-	Pause chan<- struct{}
-	Stop  chan<- struct{}
-}
-
 
 // Connect launches a goroutine that dispatches voice to a discord guild
 // Queue
 // Close
 // Since discord allows only one voice connection per guild, you should call close before calling connect again for the same guild
-func Connect(s *discordgo.Session, guildID string, idleChannelID string, opts ...VoiceOption) (Senders, func()) {
+func Connect(s *discordgo.Session, guildID string, idleChannelID string, opts ...VoiceOption) (Sends, func()) {
 	cfg := DefaultConfig
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-
-	queue := make(chan *Payload, cfg.QueueLength)
 
 	// close quit channel and all attempts to receive it will receive it without blocking
 	// quit channel is hidden from the outside world
@@ -110,49 +95,45 @@ func Connect(s *discordgo.Session, guildID string, idleChannelID string, opts ..
 		}
 	}
 
+	queue := make(chan *Payload, cfg.QueueLength)
+	ctrl := make(chan Control, 1)
+
 	join := func(channelID string) (*discordgo.VoiceConnection, error) {
 		return s.ChannelVoiceJoin(guildID, channelID, false, true)
 	}
 
 	// coerce queue and quit to receieve/send-only in structs
-	recv := receivers{
-		quit: quit,
+	recv := receives{
+		quit:  quit,
 		queue: queue,
+		ctrl:  ctrl,
 	}
-	send := Senders{
-		Queue: queue,
-	}
-	if cfg.Skippable {
-		skip := make(chan struct{}, 1)
-		send.Skip = skip
-		recv.skip = skip
+	send := Sends{
+		Queue:   queue,
+		Control: ctrl,
 	}
 
 	go payloadSender(recv, join, idleChannelID, cfg.SendTimeout, cfg.IdleTimeout)
 	// coerce queue to send-only in voicebox
 	return send, close
 }
-type receivers struct {
+
+type receives struct {
 	quit  <-chan struct{}
 	queue <-chan *Payload
-	skip  <-chan struct{}
-	pause <-chan struct{}
-	stop  <-chan struct{}
+	ctrl  <-chan Control
 }
 
-func payloadSender(sig receivers, join func(cID string) (*discordgo.VoiceConnection, error), idleChannelID string, sendTimeout int, idleTimeout int) {
-	if sig.quit == nil || sig.queue == nil {
+func payloadSender(recv receives, join func(cID string) (*discordgo.VoiceConnection, error), idleChannelID string, sendTimeout int, idleTimeout int) {
+	if recv.quit == nil || recv.queue == nil {
 		return
 	}
 
 	var vc *discordgo.VoiceConnection
 	var err error
 
-	var vp *Payload
+	var p *Payload
 	var ok bool
-
-	var reader dca.OpusReader
-	var frame []byte
 
 	var idleTimer <-chan time.Time
 
@@ -167,19 +148,18 @@ func payloadSender(sig receivers, join func(cID string) (*discordgo.VoiceConnect
 
 	vc, _ = join(idleChannelID)
 
-PayloadLoop:
 	for {
 		// check quit signal between every payload without blocking
 		// otherwise it would be possible for a quit signal to go ignored at least once if there is a continuous stream of voice payloads ready in queue
 		// since when multiple cases in a select are ready at same time a case is selected randomly
 		select {
-		case <-sig.quit:
+		case <-recv.quit:
 			return
 		default:
 		}
 
 		select {
-		case <-sig.quit:
+		case <-recv.quit:
 			return
 		// idletimer is started only once after each payload
 		// not every time we enter this select, to prevent repeatedly rejoining idle channel
@@ -189,57 +169,97 @@ PayloadLoop:
 			if err != nil {
 				disconnect()
 			}
-			continue PayloadLoop
-		case vp, ok = <-sig.queue:
+			continue
+		case p, ok = <-recv.queue:
 			if !ok {
 				return
 			}
 		}
 
-		reader = dca.NewDecoder(vp.Reader)
-		vc, err = join(vp.ChannelID)
+		vc, err = join(p.ChannelID)
 		if err != nil {
 			log.Printf("Error join payload channel %v", err)
-			continue PayloadLoop
+		} else {
+			sendPayload(recv, p, vc, sendTimeout)
 		}
-
-		_ = vc.Speaking(true)
-	FrameLoop:
-		for {
-			// check quit/pause/stop signals between every frame
-			// when multiple cases in a select are ready at same time a case is selected randomly
-			// otherwise it would be possible for a quit signal to go ignored for an unacceptable amount of time if there are a lot of frames in the buffer
-			// and vc.OpusSend is ready for every send
-			select {
-			case <-sig.quit:
-				return
-			case <-sig.skip:
-				break FrameLoop
-			default:
-			}
-
-			frame, err = reader.OpusFrame()
-			// underlying impl is encoding/binary.Read
-			// err is EOF iff no bytes were read
-			// err is UnexpectedEOF if partial frame is read
-			if err != nil {
-				log.Printf("Error read frame %v", err)
-				break FrameLoop
-			}
-
-			select {
-			case <-sig.quit:
-				return
-			case vc.OpusSend <- frame:
-			case <-time.After(time.Duration(sendTimeout) * time.Millisecond):
-				log.Printf("Opus send timeout in guild %v", vc.GuildID)
-				break FrameLoop
-			}
-		}
-		_ = vc.Speaking(false)
-		if rc, ok := vp.Reader.(io.Closer); ok {
-			rc.Close()
+		if closer, ok := p.Reader.(io.Closer); ok {
+			closer.Close()
 		}
 		idleTimer = time.NewTimer(time.Duration(idleTimeout) * time.Millisecond).C
+	}
+}
+
+var defaultEncodeOptions = dca.EncodeOptions{
+	Volume:           256,
+	Channels:         2,
+	FrameRate:        48000,
+	FrameDuration:    20,
+	Bitrate:          128,
+	RawOutput:        false,
+	Application:      dca.AudioApplicationAudio,
+	CompressionLevel: 10,
+	PacketLoss:       1,
+	BufferedFrames:   100,
+	VBR:              true,
+}
+
+func sendPayload(recv receives, p *Payload, vc *discordgo.VoiceConnection, sendTimeout int) {
+	var err error
+	var paused bool
+	var frame []byte
+	reader := p.Reader
+	if !p.DCAEncoded {
+		encoder, err := dca.EncodeMem(p.Reader, &defaultEncodeOptions)
+		if err != nil {
+			return
+		}
+		defer encoder.Cleanup()
+		reader = encoder
+	}
+	opusReader := dca.NewDecoder(reader)
+	vc.Speaking(true)
+	defer vc.Speaking(false)
+	for {
+		select {
+		case <-recv.quit:
+			return
+		case c, _ := <-recv.ctrl:
+			switch c {
+			case Skip:
+				return
+			case Pause:
+				paused = !paused
+			}
+		default:
+		}
+
+		if paused {
+			select {
+			case <-recv.quit:
+				return
+			case c, _ := <-recv.ctrl:
+				switch c {
+				case Skip:
+					return
+				case Pause:
+					paused = !paused
+				}
+			}
+		}
+
+		// underlying impl is encoding/binary.Read
+		// err is EOF iff no bytes were read
+		// err is UnexpectedEOF if partial frame is read
+		frame, err = opusReader.OpusFrame()
+		if err != nil {
+			return
+		}
+
+		select {
+		case <-recv.quit:
+		case vc.OpusSend <- frame:
+		case <-time.After(time.Duration(sendTimeout) * time.Millisecond):
+			return
+		}
 	}
 }
