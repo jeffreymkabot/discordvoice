@@ -250,7 +250,7 @@ func sendPayload(recv *receives, p *Payload, vc *discordgo.VoiceConnection, send
 	reader := p.Reader
 	if !p.PreEncoded {
 		opts := defaultEncodeOptions
-		if 0 <= p.Volume && p.Volume < 256 {
+		if 0 < p.Volume && p.Volume < 256 {
 			opts.Volume = p.Volume
 		}
 		encoder, err := dca.EncodeMem(p.Reader, &opts)
