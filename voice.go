@@ -1,6 +1,7 @@
 package discordvoice
 
 import (
+	"errors"
 	"io"
 	"log"
 	"time"
@@ -14,28 +15,13 @@ type VoiceConfig struct {
 	QueueLength int `toml:"queue_length"`
 	SendTimeout int `toml:"send_timeout"`
 	IdleTimeout int `toml:"afk_timeout"`
-	Broadcast bool
+	Broadcast   bool
 }
 
 var DefaultConfig = VoiceConfig{
 	QueueLength: 100,
 	SendTimeout: 1000,
 	IdleTimeout: 300,
-}
-
-type Control uint8
-
-const (
-	nop Control = iota
-	Skip
-	Pause
-)
-
-// Payload
-type Payload struct {
-	DCAEncoded bool
-	ChannelID  string
-	Reader     io.Reader
 }
 
 type VoiceOption func(*VoiceConfig)
@@ -64,65 +50,116 @@ func IdleTimeout(n int) VoiceOption {
 	}
 }
 
-type Sends struct {
-	Queue   chan<- *Payload
-	Control chan<- Control
+type control uint8
+
+const (
+	nop control = iota
+	skip
+	pause
+)
+
+// Payload
+type Payload struct {
+	PreEncoded bool
+	ChannelID  string
+	Reader     io.Reader
+	Volume     int
 }
 
-// Connect launches a goroutine that dispatches voice to a discord guild
-// Sends
-// Close
-// Since discord allows only one voice connection per guild, you should call close before calling connect again for the same guild
-func Connect(s *discordgo.Session, guildID string, idleChannelID string, opts ...VoiceOption) (Sends, func()) {
-	cfg := DefaultConfig
-	for _, opt := range opts {
-		opt(&cfg)
-	}
+var ErrSendFull = errors.New("Full send buffer")
 
-	// close quit channel and all attempts to receive it will receive it without blocking
-	// quit channel is hidden from the outside world
-	// accessed only through closure for close func
-	quit := make(chan struct{})
-	close := func() {
-		select {
-		case <-quit:
-			// already closed, don't close a closed channel
-			return
-		default:
-			close(quit)
-		}
-	}
+type Player struct {
+	quit    chan struct{}
+	queue   chan<- *Payload
+	control chan<- control
+}
 
-	queue := make(chan *Payload, cfg.QueueLength)
-	ctrl := make(chan Control, 1)
-
-	join := func(channelID string) (*discordgo.VoiceConnection, error) {
-		return s.ChannelVoiceJoin(guildID, channelID, false, true)
+// Enqueue puts an item at the end of the queue
+func (play *Player) Enqueue(p *Payload) error {
+	select {
+	case play.queue <- p:
+	default:
+		return ErrSendFull
 	}
+	return nil
+}
 
-	// coerce queue and quit to receieve/send-only in structs
-	recv := receives{
-		quit:  quit,
-		queue: queue,
-		ctrl:  ctrl,
-	}
-	send := Sends{
-		Queue:   queue,
-		Control: ctrl,
-	}
+// Length returns the number of items in the queue
+func (play *Player) Length() int {
+	return len(play.queue)
+}
 
-	go payloadSender(recv, join, idleChannelID, cfg.SendTimeout, cfg.IdleTimeout)
-	// coerce queue to send-only in voicebox
-	return send, close
+// Skip moves to the next item in the queue when an item is playing or is paused
+// Skip does nothing when there is no item in the queue or the player is already processing a control
+func (play *Player) Skip() error {
+	select {
+	case play.control <- skip:
+	default:
+		return ErrSendFull
+	}
+	return nil
+}
+
+// Pause stops the currently playing item or resumes the currently paused item
+// Pause does nothing when there is no item in the queue or the player is already processing a control
+func (play *Player) Pause() error {
+	select {
+	case play.control <- pause:
+	default:
+		return ErrSendFull
+	}
+	return nil
+}
+
+// Quit closes the player
+// You should call quit before calling connect again for the same guild
+func (play *Player) Quit() {
+	select {
+	case <-play.quit:
+		// already closed, don't close a closed channel
+		return
+	default:
+		close(play.quit)
+	}
 }
 
 type receives struct {
 	quit  <-chan struct{}
 	queue <-chan *Payload
-	ctrl  <-chan Control
+	ctrl  <-chan control
 }
 
-func payloadSender(recv receives, join func(cID string) (*discordgo.VoiceConnection, error), idleChannelID string, sendTimeout int, idleTimeout int) {
+// Connect launches a Player that dispatches voice to a discord guild
+// Since discord allows only one voice connection per guild, you should call Player.Quit before calling connect again for the same guild
+func Connect(s *discordgo.Session, guildID string, idleChannelID string, opts ...VoiceOption) *Player {
+	cfg := DefaultConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
+	quit := make(chan struct{})
+	queue := make(chan *Payload, cfg.QueueLength)
+	ctrl := make(chan control, 1)
+
+	// coerce channels to receieve/send-only in structs
+	recv := &receives{
+		quit:  quit,
+		queue: queue,
+		ctrl:  ctrl,
+	}
+
+	send := &Player{
+		quit:    quit,
+		queue:   queue,
+		control: ctrl,
+	}
+
+	go payloadSender(recv, s, guildID, idleChannelID, cfg.SendTimeout, cfg.IdleTimeout)
+
+	return send
+}
+
+func payloadSender(recv *receives, s *discordgo.Session, guildID string, idleChannelID string, sendTimeout int, idleTimeout int) {
 	if recv.quit == nil || recv.queue == nil {
 		return
 	}
@@ -140,6 +177,10 @@ func payloadSender(recv receives, join func(cID string) (*discordgo.VoiceConnect
 			_ = vc.Disconnect()
 			vc = nil
 		}
+	}
+
+	join := func(channelID string) (*discordgo.VoiceConnection, error) {
+		return s.ChannelVoiceJoin(guildID, channelID, false, true)
 	}
 
 	defer disconnect()
@@ -176,7 +217,7 @@ func payloadSender(recv receives, join func(cID string) (*discordgo.VoiceConnect
 
 		vc, err = join(p.ChannelID)
 		if err != nil {
-			log.Printf("Error join payload channel %v", err)
+			log.Printf("error join payload channel %v", err)
 		} else {
 			sendPayload(recv, p, vc, sendTimeout)
 		}
@@ -201,13 +242,18 @@ var defaultEncodeOptions = dca.EncodeOptions{
 	VBR:              true,
 }
 
-func sendPayload(recv receives, p *Payload, vc *discordgo.VoiceConnection, sendTimeout int) {
+func sendPayload(recv *receives, p *Payload, vc *discordgo.VoiceConnection, sendTimeout int) {
 	var err error
 	var paused bool
 	var frame []byte
+
 	reader := p.Reader
-	if !p.DCAEncoded {
-		encoder, err := dca.EncodeMem(p.Reader, &defaultEncodeOptions)
+	if !p.PreEncoded {
+		opts := defaultEncodeOptions
+		if 0 <= p.Volume && p.Volume < 256 {
+			opts.Volume = p.Volume
+		}
+		encoder, err := dca.EncodeMem(p.Reader, &opts)
 		if err != nil {
 			log.Printf("error encoding audio %v", err)
 			return
@@ -216,37 +262,35 @@ func sendPayload(recv receives, p *Payload, vc *discordgo.VoiceConnection, sendT
 		reader = encoder
 	}
 	opusReader := dca.NewDecoder(reader)
-	err = opusReader.ReadMetadata()
-	if err != nil {
-		log.Printf("metadata %#v", opusReader.Metadata)
-	} else {
-		log.Printf("no metadata :(")
-	}
+
+	drain(recv.ctrl)
 	vc.Speaking(true)
 	defer vc.Speaking(false)
+
 	for {
 		select {
 		case <-recv.quit:
 			return
 		case c, _ := <-recv.ctrl:
 			switch c {
-			case Skip:
+			case skip:
 				return
-			case Pause:
+			case pause:
 				paused = !paused
 			}
 		default:
 		}
 
+		// TODO figure out a way to impl pause without repeating select block
 		if paused {
 			select {
 			case <-recv.quit:
 				return
 			case c, _ := <-recv.ctrl:
 				switch c {
-				case Skip:
+				case skip:
 					return
-				case Pause:
+				case pause:
 					paused = !paused
 				}
 			}
@@ -257,13 +301,26 @@ func sendPayload(recv receives, p *Payload, vc *discordgo.VoiceConnection, sendT
 		// err is UnexpectedEOF if partial frame is read
 		frame, err = opusReader.OpusFrame()
 		if err != nil {
+			log.Printf("error reading frame %v", err)
 			return
 		}
 
 		select {
 		case <-recv.quit:
+			return
 		case vc.OpusSend <- frame:
 		case <-time.After(time.Duration(sendTimeout) * time.Millisecond):
+			log.Printf("send timeout on %#v", vc)
+			return
+		}
+	}
+}
+
+func drain(c <-chan control) {
+	for {
+		select {
+		case <-c:
+		default:
 			return
 		}
 	}
