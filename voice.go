@@ -12,10 +12,10 @@ import (
 
 // VoiceConfig
 type VoiceConfig struct {
-	QueueLength int `toml:"queue_length"`
-	SendTimeout int `toml:"send_timeout"`
-	IdleTimeout int `toml:"afk_timeout"`
-	Broadcast   bool
+	QueueLength        int `toml:"queue_length"`
+	SendTimeout        int `toml:"send_timeout"`
+	IdleTimeout        int `toml:"afk_timeout"`
+	CanBroadcastStatus bool
 }
 
 var DefaultConfig = VoiceConfig{
@@ -50,6 +50,12 @@ func IdleTimeout(n int) VoiceOption {
 	}
 }
 
+func CanBroadcastStatus(b bool) VoiceOption {
+	return func(cfg *VoiceConfig) {
+		cfg.CanBroadcastStatus = b
+	}
+}
+
 type control uint8
 
 const (
@@ -64,6 +70,7 @@ type Payload struct {
 	ChannelID  string
 	Reader     io.Reader
 	Volume     int
+	Name       string
 }
 
 var ErrSendFull = errors.New("Full send buffer")
@@ -154,12 +161,12 @@ func Connect(s *discordgo.Session, guildID string, idleChannelID string, opts ..
 		control: ctrl,
 	}
 
-	go payloadSender(recv, s, guildID, idleChannelID, cfg.SendTimeout, cfg.IdleTimeout)
+	go payloadSender(recv, s, guildID, idleChannelID, cfg.CanBroadcastStatus, cfg.SendTimeout, cfg.IdleTimeout)
 
 	return send
 }
 
-func payloadSender(recv *receives, s *discordgo.Session, guildID string, idleChannelID string, sendTimeout int, idleTimeout int) {
+func payloadSender(recv *receives, s *discordgo.Session, guildID string, idleChannelID string, canSetStatus bool, sendTimeout int, idleTimeout int) {
 	if recv.quit == nil || recv.queue == nil {
 		return
 	}
@@ -181,6 +188,19 @@ func payloadSender(recv *receives, s *discordgo.Session, guildID string, idleCha
 
 	join := func(channelID string) (*discordgo.VoiceConnection, error) {
 		return s.ChannelVoiceJoin(guildID, channelID, false, true)
+	}
+
+	setStatus := func(status string) {}
+	if canSetStatus {
+		setStatus = func(status string) {
+			if len(status) > 32 {
+				status = status[:32]
+			}
+			err := s.GuildMemberNickname(guildID, "@me", status)
+			if err != nil {
+				log.Printf("error set nickname %v", err)
+			}
+		}
 	}
 
 	defer disconnect()
@@ -219,7 +239,7 @@ func payloadSender(recv *receives, s *discordgo.Session, guildID string, idleCha
 		if err != nil {
 			log.Printf("error join payload channel %v", err)
 		} else {
-			sendPayload(recv, p, vc, sendTimeout)
+			sendPayload(recv, p, setStatus, vc, sendTimeout)
 		}
 		if closer, ok := p.Reader.(io.Closer); ok {
 			closer.Close()
@@ -242,7 +262,7 @@ var defaultEncodeOptions = dca.EncodeOptions{
 	VBR:              true,
 }
 
-func sendPayload(recv *receives, p *Payload, vc *discordgo.VoiceConnection, sendTimeout int) {
+func sendPayload(recv *receives, p *Payload, setStatus func(string), vc *discordgo.VoiceConnection, sendTimeout int) {
 	var err error
 	var paused bool
 	var frame []byte
@@ -267,6 +287,11 @@ func sendPayload(recv *receives, p *Payload, vc *discordgo.VoiceConnection, send
 	vc.Speaking(true)
 	defer vc.Speaking(false)
 
+	if p.Name != "" {
+		setStatus("🔊 " + p.Name)
+		defer setStatus("")
+	}
+
 	for {
 		select {
 		case <-recv.quit:
@@ -283,6 +308,7 @@ func sendPayload(recv *receives, p *Payload, vc *discordgo.VoiceConnection, send
 
 		// TODO figure out a way to impl pause without repeating select block
 		if paused {
+			setStatus("⏸️ " + p.Name)
 			select {
 			case <-recv.quit:
 				return
@@ -292,6 +318,7 @@ func sendPayload(recv *receives, p *Payload, vc *discordgo.VoiceConnection, send
 					return
 				case pause:
 					paused = !paused
+					setStatus("🔊 " + p.Name)
 				}
 			}
 		}
