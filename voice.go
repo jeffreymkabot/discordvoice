@@ -4,11 +4,14 @@ import (
 	"errors"
 	"io"
 	"log"
+	"net/http"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/jonas747/dca"
 )
+
+const version = "0.0.1"
 
 // VoiceConfig
 type VoiceConfig struct {
@@ -67,10 +70,12 @@ const (
 // Payload
 type Payload struct {
 	PreEncoded bool
-	ChannelID  string
 	Reader     io.Reader
+	URL        string
+	ChannelID  string
 	Volume     int
 	Name       string
+	Duration   time.Duration
 }
 
 var ErrSendFull = errors.New("Full send buffer")
@@ -259,7 +264,8 @@ var defaultEncodeOptions = dca.EncodeOptions{
 	CompressionLevel: 10,
 	PacketLoss:       1,
 	BufferedFrames:   100,
-	VBR:              true,
+	VBR:              false,
+	AudioFilter:      "",
 }
 
 func sendPayload(recv *receives, p *Payload, setStatus func(string), vc *discordgo.VoiceConnection, sendTimeout int) {
@@ -267,21 +273,36 @@ func sendPayload(recv *receives, p *Payload, setStatus func(string), vc *discord
 	var paused bool
 	var frame []byte
 
-	reader := p.Reader
-	if !p.PreEncoded {
+	log.Printf("begin send %v", p.Name)
+
+	var elapsed time.Duration
+	defer log.Printf("read %v of %v, expected %v", elapsed, p.Name, p.Duration)
+
+	var opusReader dca.OpusReader
+	if p.PreEncoded {
+		opusReader = dca.NewDecoder(p.Reader)
+	} else {
+		resp, err := http.Get(p.URL)
+		if err != nil {
+			log.Printf("error request url %v", err)
+		}
+		log.Printf("resp %#v", resp)
+		defer resp.Body.Close()
 		opts := defaultEncodeOptions
 		if 0 < p.Volume && p.Volume < 256 {
 			opts.Volume = p.Volume
 		}
-		encoder, err := dca.EncodeMem(p.Reader, &opts)
+		encoder, err := dca.EncodeMem(resp.Body, &opts)
 		if err != nil {
 			log.Printf("error encoding audio %v", err)
 			return
 		}
 		defer encoder.Cleanup()
-		reader = encoder
+		opusReader = encoder
 	}
-	opusReader := dca.NewDecoder(reader)
+
+	frameSize := opusReader.FrameDuration()
+	log.Printf("frame size %v", frameSize)
 
 	drain(recv.ctrl)
 	vc.Speaking(true)
@@ -319,6 +340,7 @@ func sendPayload(recv *receives, p *Payload, setStatus func(string), vc *discord
 				case pause:
 					paused = !paused
 					setStatus("🔊 " + p.Name)
+
 				}
 			}
 		}
@@ -340,6 +362,8 @@ func sendPayload(recv *receives, p *Payload, setStatus func(string), vc *discord
 			log.Printf("send timeout on %#v", vc)
 			return
 		}
+
+		elapsed += frameSize
 	}
 }
 
