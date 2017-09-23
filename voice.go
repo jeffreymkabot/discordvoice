@@ -192,7 +192,10 @@ func payloadSender(recv *receives, s *discordgo.Session, guildID string, idleCha
 	}
 
 	join := func(channelID string) (*discordgo.VoiceConnection, error) {
-		return s.ChannelVoiceJoin(guildID, channelID, false, true)
+		if vc == nil || vc.ChannelID != p.ChannelID {
+			return s.ChannelVoiceJoin(guildID, channelID, false, true)
+		}
+		return vc, nil
 	}
 
 	setStatus := func(status string) {}
@@ -243,9 +246,8 @@ func payloadSender(recv *receives, s *discordgo.Session, guildID string, idleCha
 			}
 		}
 
-		if vc == nil || vc.ChannelID != p.ChannelID {
-			vc, err = join(p.ChannelID)
-		}
+		vc, err = join(p.ChannelID)
+		
 		if err != nil {
 			log.Printf("error join payload channel %v", err)
 		} else {
