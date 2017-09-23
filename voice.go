@@ -210,7 +210,10 @@ func payloadSender(recv *receives, s *discordgo.Session, guildID string, idleCha
 
 	defer disconnect()
 
-	vc, _ = join(idleChannelID)
+	vc, err = join(idleChannelID)
+	if err != nil {
+		log.Printf("error join idle channel %v", err)
+	}
 
 	for {
 		// check quit signal between every payload without blocking
@@ -231,7 +234,7 @@ func payloadSender(recv *receives, s *discordgo.Session, guildID string, idleCha
 			log.Printf("idle timeout in guild %v", vc.GuildID)
 			vc, err = join(idleChannelID)
 			if err != nil {
-				disconnect()
+				log.Printf("error join idle channel %v", err)
 			}
 			continue
 		case p, ok = <-recv.queue:
@@ -240,14 +243,13 @@ func payloadSender(recv *receives, s *discordgo.Session, guildID string, idleCha
 			}
 		}
 
-		vc, err = join(p.ChannelID)
+		if vc == nil || vc.ChannelID != p.ChannelID {
+			vc, err = join(p.ChannelID)
+		}
 		if err != nil {
 			log.Printf("error join payload channel %v", err)
 		} else {
 			sendPayload(recv, p, setStatus, vc, sendTimeout)
-		}
-		if closer, ok := p.Reader.(io.Closer); ok {
-			closer.Close()
 		}
 		idleTimer = time.NewTimer(time.Duration(idleTimeout) * time.Millisecond).C
 	}
@@ -276,7 +278,9 @@ func sendPayload(recv *receives, p *Payload, setStatus func(string), vc *discord
 	log.Printf("begin send %v", p.Name)
 
 	var elapsed time.Duration
-	defer log.Printf("read %v of %v, expected %v", elapsed, p.Name, p.Duration)
+	// use an anonymous function so it reads the value of elapsed in its closure instead of in its paramters
+	// this way it prints the value of elapsed at the time it is executed rather than the time it is deferred
+	defer func() { log.Printf("read %v of %v, expected %v", elapsed, p.Name, p.Duration) }()
 
 	var opusReader dca.OpusReader
 	if p.PreEncoded {
