@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Workiva/go-datastructures/queue"
 	"github.com/bwmarrin/discordgo"
 	"github.com/jonas747/dca"
 )
@@ -29,6 +30,8 @@ var DefaultConfig = VoiceConfig{
 
 type VoiceOption func(*VoiceConfig)
 
+// QueueLength sets the maximum number of items that will be allowed in the queue
+// n will be rounded up to the next power of 2
 func QueueLength(n int) VoiceOption {
 	return func(cfg *VoiceConfig) {
 		if n > 0 {
@@ -81,24 +84,24 @@ type Payload struct {
 var ErrSendFull = errors.New("Full send buffer")
 
 type Player struct {
-	quit    chan struct{}
-	queue   chan<- *Payload
-	control chan<- control
+	quit chan struct{}
+	// use a ringbuffer to enforce a fixed maximum length
+	queue   *queue.RingBuffer
+	control chan control
 }
 
 // Enqueue puts an item at the end of the queue
 func (play *Player) Enqueue(p *Payload) error {
-	select {
-	case play.queue <- p:
-	default:
+	ok, err := play.queue.Offer(p)
+	if !ok {
 		return ErrSendFull
 	}
-	return nil
+	return err
 }
 
 // Length returns the number of items in the queue
 func (play *Player) Length() int {
-	return len(play.queue)
+	return int(play.queue.Len())
 }
 
 // Skip moves to the next item in the queue when an item is playing or is paused
@@ -135,12 +138,6 @@ func (play *Player) Quit() {
 	}
 }
 
-type receives struct {
-	quit  <-chan struct{}
-	queue <-chan *Payload
-	ctrl  <-chan control
-}
-
 // Connect launches a Player that dispatches voice to a discord guild
 // Since discord allows only one voice connection per guild, you should call Player.Quit before calling connect again for the same guild
 func Connect(s *discordgo.Session, guildID string, idleChannelID string, opts ...VoiceOption) *Player {
@@ -150,15 +147,13 @@ func Connect(s *discordgo.Session, guildID string, idleChannelID string, opts ..
 	}
 
 	quit := make(chan struct{})
-	queue := make(chan *Payload, cfg.QueueLength)
+	// queue := make(chan *Payload, cfg.QueueLength)
+	queue := queue.NewRingBuffer(uint64(cfg.QueueLength))
+	go func() {
+		<-quit
+		queue.Dispose()
+	}()
 	ctrl := make(chan control, 1)
-
-	// coerce channels to receieve/send-only in structs
-	recv := &receives{
-		quit:  quit,
-		queue: queue,
-		ctrl:  ctrl,
-	}
 
 	send := &Player{
 		quit:    quit,
@@ -166,23 +161,25 @@ func Connect(s *discordgo.Session, guildID string, idleChannelID string, opts ..
 		control: ctrl,
 	}
 
-	go payloadSender(recv, s, guildID, idleChannelID, cfg.CanBroadcastStatus, cfg.SendTimeout, cfg.IdleTimeout)
+	go payloadSender(send, s, guildID, idleChannelID, cfg.CanBroadcastStatus, cfg.SendTimeout, cfg.IdleTimeout)
 
 	return send
 }
 
-func payloadSender(recv *receives, s *discordgo.Session, guildID string, idleChannelID string, canSetStatus bool, sendTimeout int, idleTimeout int) {
-	if recv.quit == nil || recv.queue == nil {
+func payloadSender(play *Player, s *discordgo.Session, guildID string, idleChannelID string, canSetStatus bool, sendTimeout int, idleTimeout int) {
+	if play.quit == nil || play.queue == nil || play.queue.IsDisposed() {
 		return
 	}
 
 	var vc *discordgo.VoiceConnection
 	var err error
 
+	var item interface{}
 	var p *Payload
 	var ok bool
 
-	var idleTimer <-chan time.Time
+	// var isIdle bool
+	pollTimeout := time.Duration(idleTimeout) * time.Millisecond
 
 	disconnect := func() {
 		if vc != nil {
@@ -192,7 +189,10 @@ func payloadSender(recv *receives, s *discordgo.Session, guildID string, idleCha
 	}
 
 	join := func(channelID string) (*discordgo.VoiceConnection, error) {
-		return s.ChannelVoiceJoin(guildID, channelID, false, true)
+		if vc == nil || vc.ChannelID != channelID {
+			return s.ChannelVoiceJoin(guildID, channelID, false, true)
+		}
+		return vc, nil
 	}
 
 	setStatus := func(status string) {}
@@ -214,44 +214,36 @@ func payloadSender(recv *receives, s *discordgo.Session, guildID string, idleCha
 	if err != nil {
 		log.Printf("error join idle channel %v", err)
 	}
-
 	for {
-		// check quit signal between every payload without blocking
-		// otherwise it would be possible for a quit signal to go ignored at least once if there is a continuous stream of voice payloads ready in queue
-		// since when multiple cases in a select are ready at same time a case is selected randomly
-		select {
-		case <-recv.quit:
-			return
-		default:
-		}
 
-		select {
-		case <-recv.quit:
-			return
-		// idletimer is started only once after each payload
-		// not every time we enter this select, to prevent repeatedly rejoining idle channel
-		case <-idleTimer:
-			log.Printf("idle timeout in guild %v", vc.GuildID)
+		item, err = play.queue.Poll(pollTimeout)
+
+		if err == queue.ErrTimeout {
+			pollTimeout = 0
 			vc, err = join(idleChannelID)
 			if err != nil {
 				log.Printf("error join idle channel %v", err)
 			}
 			continue
-		case p, ok = <-recv.queue:
-			if !ok {
-				return
-			}
+		} else if err != nil {
+			// disposed
+			return
 		}
 
-		if vc == nil || vc.ChannelID != p.ChannelID {
-			vc, err = join(p.ChannelID)
+		p, ok = item.(*Payload)
+		if !ok {
+			// should not be possible, but avoid panics just in case
+			pollTimeout = time.Duration(idleTimeout) * time.Millisecond
+			continue
 		}
+
+		vc, err = join(p.ChannelID)
 		if err != nil {
 			log.Printf("error join payload channel %v", err)
 		} else {
-			sendPayload(recv, p, setStatus, vc, sendTimeout)
+			sendPayload(play, p, setStatus, vc, sendTimeout)
 		}
-		idleTimer = time.NewTimer(time.Duration(idleTimeout) * time.Millisecond).C
+		pollTimeout = time.Duration(idleTimeout) * time.Millisecond
 	}
 }
 
@@ -270,7 +262,7 @@ var defaultEncodeOptions = dca.EncodeOptions{
 	AudioFilter:      "",
 }
 
-func sendPayload(recv *receives, p *Payload, setStatus func(string), vc *discordgo.VoiceConnection, sendTimeout int) {
+func sendPayload(play *Player, p *Payload, setStatus func(string), vc *discordgo.VoiceConnection, sendTimeout int) {
 	var err error
 	var paused bool
 	var frame []byte
@@ -279,7 +271,7 @@ func sendPayload(recv *receives, p *Payload, setStatus func(string), vc *discord
 
 	var elapsed time.Duration
 	// use an anonymous function so it reads the value of elapsed in its closure instead of in its paramters
-	// this way it prints the value of elapsed at the time it is executed rather than the time it is deferred
+	// this way log.Printf prints the value of elapsed at the time it is executed rather than the time it is deferred
 	defer func() { log.Printf("read %v of %v, expected %v", elapsed, p.Name, p.Duration) }()
 
 	var opusReader dca.OpusReader
@@ -308,7 +300,7 @@ func sendPayload(recv *receives, p *Payload, setStatus func(string), vc *discord
 	frameSize := opusReader.FrameDuration()
 	log.Printf("frame size %v", frameSize)
 
-	drain(recv.ctrl)
+	drain(play.control)
 	vc.Speaking(true)
 	defer vc.Speaking(false)
 
@@ -319,9 +311,9 @@ func sendPayload(recv *receives, p *Payload, setStatus func(string), vc *discord
 
 	for {
 		select {
-		case <-recv.quit:
+		case <-play.quit:
 			return
-		case c, _ := <-recv.ctrl:
+		case c, _ := <-play.control:
 			switch c {
 			case skip:
 				return
@@ -335,9 +327,9 @@ func sendPayload(recv *receives, p *Payload, setStatus func(string), vc *discord
 		if paused {
 			setStatus("⏸️ " + p.Name)
 			select {
-			case <-recv.quit:
+			case <-play.quit:
 				return
-			case c, _ := <-recv.ctrl:
+			case c, _ := <-play.control:
 				switch c {
 				case skip:
 					return
@@ -359,7 +351,7 @@ func sendPayload(recv *receives, p *Payload, setStatus func(string), vc *discord
 		}
 
 		select {
-		case <-recv.quit:
+		case <-play.quit:
 			return
 		case vc.OpusSend <- frame:
 		case <-time.After(time.Duration(sendTimeout) * time.Millisecond):
