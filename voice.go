@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/Workiva/go-datastructures/queue"
@@ -31,7 +32,6 @@ var DefaultConfig = VoiceConfig{
 type VoiceOption func(*VoiceConfig)
 
 // QueueLength sets the maximum number of items that will be allowed in the queue
-// n will be rounded up to the next power of 2
 func QueueLength(n int) VoiceOption {
 	return func(cfg *VoiceConfig) {
 		if n > 0 {
@@ -84,24 +84,38 @@ type Payload struct {
 var ErrSendFull = errors.New("Full send buffer")
 
 type Player struct {
+	// mutex to prevent concurrent attempts to enqueue to get around QueueLength
+	mu   sync.Mutex
 	quit chan struct{}
-	// use a ringbuffer to enforce a fixed maximum length
-	queue   *queue.RingBuffer
+	// can't use a ringbuffer since it's bugged and uses all the cpu
+	queue   *queue.Queue
 	control chan control
+	cfg     *VoiceConfig
 }
 
 // Enqueue puts an item at the end of the queue
 func (play *Player) Enqueue(p *Payload) error {
-	ok, err := play.queue.Offer(p)
-	if !ok {
+	play.mu.Lock()
+	defer play.mu.Unlock()
+	if play.queue.Len() >= int64(play.cfg.QueueLength) {
 		return ErrSendFull
 	}
-	return err
+	return play.queue.Put(p)
 }
 
 // Length returns the number of items in the queue
 func (play *Player) Length() int {
 	return int(play.queue.Len())
+}
+
+// Next returns the name of the next item in the queue
+func (play *Player) Next() string {
+	if item, err := play.queue.Peek(); err != nil {
+		if p, ok := item.(*Payload); ok {
+			return p.Name
+		}
+	}
+	return ""
 }
 
 // Skip moves to the next item in the queue when an item is playing or is paused
@@ -147,8 +161,7 @@ func Connect(s *discordgo.Session, guildID string, idleChannelID string, opts ..
 	}
 
 	quit := make(chan struct{})
-	// queue := make(chan *Payload, cfg.QueueLength)
-	queue := queue.NewRingBuffer(uint64(cfg.QueueLength))
+	queue := queue.New(int64(cfg.QueueLength))
 	go func() {
 		<-quit
 		queue.Dispose()
@@ -159,6 +172,7 @@ func Connect(s *discordgo.Session, guildID string, idleChannelID string, opts ..
 		quit:    quit,
 		queue:   queue,
 		control: ctrl,
+		cfg:     &cfg,
 	}
 
 	go payloadSender(send, s, guildID, idleChannelID, cfg.CanBroadcastStatus, cfg.SendTimeout, cfg.IdleTimeout)
@@ -167,14 +181,14 @@ func Connect(s *discordgo.Session, guildID string, idleChannelID string, opts ..
 }
 
 func payloadSender(play *Player, s *discordgo.Session, guildID string, idleChannelID string, canSetStatus bool, sendTimeout int, idleTimeout int) {
-	if play.quit == nil || play.queue == nil || play.queue.IsDisposed() {
+	if play.quit == nil || play.queue == nil || play.queue.Disposed() {
 		return
 	}
 
 	var vc *discordgo.VoiceConnection
 	var err error
 
-	var item interface{}
+	var items []interface{}
 	var p *Payload
 	var ok bool
 
@@ -216,7 +230,7 @@ func payloadSender(play *Player, s *discordgo.Session, guildID string, idleChann
 	}
 	for {
 
-		item, err = play.queue.Poll(pollTimeout)
+		items, err = play.queue.Poll(1, pollTimeout)
 
 		if err == queue.ErrTimeout {
 			pollTimeout = 0
@@ -228,11 +242,14 @@ func payloadSender(play *Player, s *discordgo.Session, guildID string, idleChann
 		} else if err != nil {
 			// disposed
 			return
+		} else if len(items) != 1 {
+			// should not be possible, but avoid a panic just in case
+			continue
 		}
 
-		p, ok = item.(*Payload)
+		p, ok = items[0].(*Payload)
 		if !ok {
-			// should not be possible, but avoid panics just in case
+			// should not be possible, but avoid a panic just in case
 			pollTimeout = time.Duration(idleTimeout) * time.Millisecond
 			continue
 		}
