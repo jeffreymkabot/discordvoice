@@ -29,9 +29,9 @@ var DefaultConfig = PlayerConfig{
 
 // PlayerConfig sets some behaviors of the Player
 type PlayerConfig struct {
-	QueueLength        int `toml:"queue_length"`
-	SendTimeout        int `toml:"send_timeout"`
-	IdleTimeout        int `toml:"afk_timeout"`
+	QueueLength        int  `toml:"queue_length"`
+	SendTimeout        int  `toml:"send_timeout"`
+	IdleTimeout        int  `toml:"afk_timeout"`
 	CanBroadcastStatus bool `toml:"broadcast_status"`
 }
 
@@ -143,12 +143,13 @@ func (play *Player) Quit() {
 }
 
 // Connect launches a Player that dispatches voice to a discord guild
-// Since discord allows only one voice connection per guild, you should call Player.Quit before calling connect again for the same guild
+// Since discord allows only one voice connection per guild, you should call Player.Quit before calling Connect again for the same guild
 func Connect(s *discordgo.Session, guildID string, idleChannelID string, opts ...PlayerOption) *Player {
 	cfg := DefaultConfig
 	for _, opt := range opts {
 		opt(&cfg)
 	}
+	// cfg no longer changes after applying any options
 
 	quit := make(chan struct{})
 	queue := queue.New(int64(cfg.QueueLength))
@@ -165,7 +166,7 @@ func Connect(s *discordgo.Session, guildID string, idleChannelID string, opts ..
 		cfg:     &cfg,
 	}
 
-	go payloadSender(send, s, guildID, idleChannelID, cfg.CanBroadcastStatus, cfg.SendTimeout, cfg.IdleTimeout)
+	go payloadSender(send, s, guildID, idleChannelID)
 
 	return send
 }

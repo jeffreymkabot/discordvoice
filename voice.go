@@ -11,7 +11,7 @@ import (
 	"github.com/jonas747/dca"
 )
 
-const Version = "0.0.2"
+const Version = "0.0.3"
 
 var defaultEncodeOptions = dca.EncodeOptions{
 	Volume:           256,
@@ -28,7 +28,7 @@ var defaultEncodeOptions = dca.EncodeOptions{
 	AudioFilter:      "",
 }
 
-// Payload 
+// Payload
 type Payload struct {
 	PreEncoded bool
 	Reader     io.Reader
@@ -39,7 +39,7 @@ type Payload struct {
 	Duration   time.Duration
 }
 
-func payloadSender(play *Player, s *discordgo.Session, guildID string, idleChannelID string, canSetStatus bool, sendTimeout int, idleTimeout int) {
+func payloadSender(play *Player, s *discordgo.Session, guildID string, idleChannelID string) {
 	if play.quit == nil || play.queue == nil || play.queue.Disposed() {
 		return
 	}
@@ -51,49 +51,53 @@ func payloadSender(play *Player, s *discordgo.Session, guildID string, idleChann
 	var p *Payload
 	var ok bool
 
-	// var isIdle bool
-	pollTimeout := time.Duration(idleTimeout) * time.Millisecond
+	pollTimeout := time.Duration(play.cfg.IdleTimeout) * time.Millisecond // isIdle := pollTimeout == 0
 
-	disconnect := func() {
-		if vc != nil {
-			_ = vc.Disconnect()
-			vc = nil
+	// join interacts with vc in closure
+	// join("") to disconnect
+	join := func(channelID string) error {
+		if channelID == "" && vc != nil {
+			return vc.Disconnect()
 		}
-	}
-
-	join := func(channelID string) (*discordgo.VoiceConnection, error) {
-		if vc == nil || vc.ChannelID != channelID {
-			return s.ChannelVoiceJoin(guildID, channelID, false, true)
+		// read vc.ChannelID into a temp variable because ChannelVoiceJoin takes its own write mutex on vc
+		vc.RLock()
+		vcChannelID := vc.ChannelID
+		vc.RUnlock()
+		// don't attempt to join a channel we are already in
+		if vc == nil || vcChannelID != channelID {
+			vc, err = s.ChannelVoiceJoin(guildID, channelID, false, true)
+			return err
 		}
-		return vc, nil
+		return nil
 	}
 
 	setStatus := func(status string) {}
-	if canSetStatus {
+	if play.cfg.CanBroadcastStatus {
 		setStatus = func(status string) {
 			if len(status) > 32 {
 				status = status[:32]
 			}
-			err := s.GuildMemberNickname(guildID, "@me", status)
+			err = s.GuildMemberNickname(guildID, "@me", status)
 			if err != nil {
 				log.Printf("error set nickname %v", err)
 			}
 		}
 	}
 
-	defer disconnect()
+	defer join("")
 
-	vc, err = join(idleChannelID)
+	err = join(idleChannelID)
 	if err != nil {
 		log.Printf("error join idle channel %v", err)
 	}
+
 	for {
 
 		items, err = play.queue.Poll(1, pollTimeout)
 
 		if err == queue.ErrTimeout {
 			pollTimeout = 0
-			vc, err = join(idleChannelID)
+			err = join(idleChannelID)
 			if err != nil {
 				log.Printf("error join idle channel %v", err)
 			}
@@ -109,21 +113,21 @@ func payloadSender(play *Player, s *discordgo.Session, guildID string, idleChann
 		p, ok = items[0].(*Payload)
 		if !ok {
 			// should not be possible, but avoid a panic just in case
-			pollTimeout = time.Duration(idleTimeout) * time.Millisecond
+			pollTimeout = time.Duration(play.cfg.IdleTimeout) * time.Millisecond
 			continue
 		}
 
-		vc, err = join(p.ChannelID)
+		err = join(p.ChannelID)
 		if err != nil {
 			log.Printf("error join payload channel %v", err)
 		} else {
-			sendPayload(play, p, setStatus, vc, sendTimeout)
+			sendPayload(play, p, setStatus, vc)
 		}
-		pollTimeout = time.Duration(idleTimeout) * time.Millisecond
+		pollTimeout = time.Duration(play.cfg.IdleTimeout) * time.Millisecond
 	}
 }
 
-func sendPayload(play *Player, p *Payload, setStatus func(string), vc *discordgo.VoiceConnection, sendTimeout int) {
+func sendPayload(play *Player, p *Payload, setStatus func(string), vc *discordgo.VoiceConnection) {
 	var err error
 	var paused bool
 	var frame []byte
@@ -215,7 +219,7 @@ func sendPayload(play *Player, p *Payload, setStatus func(string), vc *discordgo
 		case <-play.quit:
 			return
 		case vc.OpusSend <- frame:
-		case <-time.After(time.Duration(sendTimeout) * time.Millisecond):
+		case <-time.After(time.Duration(play.cfg.SendTimeout) * time.Millisecond):
 			log.Printf("send timeout on %#v", vc)
 			return
 		}
