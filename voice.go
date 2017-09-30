@@ -11,7 +11,7 @@ import (
 	"github.com/jonas747/dca"
 )
 
-const Version = "0.0.3"
+const Version = "0.1.0"
 
 var defaultEncodeOptions = dca.EncodeOptions{
 	Volume:           256,
@@ -28,19 +28,61 @@ var defaultEncodeOptions = dca.EncodeOptions{
 	AudioFilter:      "",
 }
 
-// Payload
-type Payload struct {
-	PreEncoded bool
-	Reader     io.Reader
-	URL        string
-	ChannelID  string
-	Volume     int
-	Name       string
-	Duration   time.Duration
+// SongOption
+type SongOption func(*song)
+
+// PreEncoded
+func PreEncoded(r io.Reader) SongOption {
+	return func(p *song) {
+		p.preencoded = true
+		p.reader = r
+	}
 }
 
-func payloadSender(play *Player, s *discordgo.Session, guildID string, idleChannelID string) {
-	if play.quit == nil || play.queue == nil || play.queue.Disposed() {
+// Volume (0, 256], default 256
+func Volume(v int) SongOption {
+	return func(p *song) {
+		p.volume = v
+	}
+}
+
+// Title tells the player the song is named something other than its url
+func Title(s string) SongOption {
+	return func(p *song) {
+		p.title = s
+	}
+}
+
+// Duration lets the player know how long it should expect the song to be
+func Duration(d time.Duration) SongOption {
+	return func(p *song) {
+		p.duration = d
+	}
+}
+
+type song struct {
+	preencoded bool
+	reader     io.Reader
+	url        string
+	channelID  string
+	volume     int
+	title      string
+	duration   time.Duration
+	// signal start, pause, done, elapsed
+	// pass values, not pointers
+	status chan<- SongStatus
+}
+
+// SongStatus
+type SongStatus struct {
+	Playing  bool
+	Title    string
+	Elapsed  time.Duration
+	Duration time.Duration
+}
+
+func sender(player *Player, session *discordgo.Session, guildID string, idleChannelID string) {
+	if player.quit == nil || player.queue == nil || player.queue.Disposed() {
 		return
 	}
 
@@ -48,10 +90,10 @@ func payloadSender(play *Player, s *discordgo.Session, guildID string, idleChann
 	var err error
 
 	var items []interface{}
-	var p *Payload
+	var s *song
 	var ok bool
 
-	pollTimeout := time.Duration(play.cfg.IdleTimeout) * time.Millisecond // isIdle := pollTimeout == 0
+	pollTimeout := time.Duration(player.cfg.IdleTimeout) * time.Millisecond // isIdle := pollTimeout == 0
 
 	// join interacts with vc in closure
 	// join("") to disconnect
@@ -59,29 +101,22 @@ func payloadSender(play *Player, s *discordgo.Session, guildID string, idleChann
 		if channelID == "" && vc != nil {
 			return vc.Disconnect()
 		}
+
 		// read vc.ChannelID into a temp variable because ChannelVoiceJoin takes its own write mutex on vc
-		vc.RLock()
-		vcChannelID := vc.ChannelID
-		vc.RUnlock()
+		vcChannelID := ""
+		if vc != nil {
+			vc.RLock()
+			vcChannelID = vc.ChannelID
+			vc.RUnlock()
+		}
+
 		// don't attempt to join a channel we are already in
 		if vc == nil || vcChannelID != channelID {
-			vc, err = s.ChannelVoiceJoin(guildID, channelID, false, true)
+			vc, err = session.ChannelVoiceJoin(guildID, channelID, false, true)
 			return err
 		}
-		return nil
-	}
 
-	setStatus := func(status string) {}
-	if play.cfg.CanBroadcastStatus {
-		setStatus = func(status string) {
-			if len(status) > 32 {
-				status = status[:32]
-			}
-			err = s.GuildMemberNickname(guildID, "@me", status)
-			if err != nil {
-				log.Printf("error set nickname %v", err)
-			}
-		}
+		return nil
 	}
 
 	defer join("")
@@ -92,9 +127,7 @@ func payloadSender(play *Player, s *discordgo.Session, guildID string, idleChann
 	}
 
 	for {
-
-		items, err = play.queue.Poll(1, pollTimeout)
-
+		items, err = player.queue.Poll(1, pollTimeout)
 		if err == queue.ErrTimeout {
 			pollTimeout = 0
 			err = join(idleChannelID)
@@ -107,72 +140,69 @@ func payloadSender(play *Player, s *discordgo.Session, guildID string, idleChann
 			return
 		} else if len(items) != 1 {
 			// should not be possible, but avoid a panic just in case
+			pollTimeout = time.Duration(player.cfg.IdleTimeout) * time.Millisecond
 			continue
 		}
 
-		p, ok = items[0].(*Payload)
+		s, ok = items[0].(*song)
 		if !ok {
 			// should not be possible, but avoid a panic just in case
-			pollTimeout = time.Duration(play.cfg.IdleTimeout) * time.Millisecond
+			pollTimeout = time.Duration(player.cfg.IdleTimeout) * time.Millisecond
 			continue
 		}
 
-		err = join(p.ChannelID)
+		err = join(s.channelID)
 		if err != nil {
 			log.Printf("error join payload channel %v", err)
+			close(s.status)
 		} else {
-			sendPayload(play, p, setStatus, vc)
+			sendSong(player, s, vc)
+			close(s.status)
 		}
-		pollTimeout = time.Duration(play.cfg.IdleTimeout) * time.Millisecond
+		pollTimeout = time.Duration(player.cfg.IdleTimeout) * time.Millisecond
 	}
 }
 
-func sendPayload(play *Player, p *Payload, setStatus func(string), vc *discordgo.VoiceConnection) {
-	var err error
+func sendSong(play *Player, s *song, vc *discordgo.VoiceConnection) {
 	var paused bool
 	var frame []byte
 
-	log.Printf("begin send %v", p.Name)
+	var frameCount int
+	var frameSize time.Duration
 
-	var elapsed time.Duration
+	log.Printf("begin send %v", s.title)
+
+	opusReader, cleanup, err := opusReader(s)
+	if err != nil {
+		log.Printf("error streaming file %v", err)
+		return
+	}
+	defer cleanup()
+	frameSize = opusReader.FrameDuration()
+
+	status := SongStatus{
+		Title: s.title,
+		Duration: s.duration,
+		Playing: true,
+		Elapsed: 0,
+	}
+
+	// send a status on start
+	select {
+	case s.status <- status:
+	default:
+	}
+
 	// use an anonymous function so it reads the value of elapsed in its closure instead of in its paramters
 	// this way log.Printf prints the value of elapsed at the time it is executed rather than the time it is deferred
-	defer func() { log.Printf("read %v of %v, expected %v", elapsed, p.Name, p.Duration) }()
-
-	var opusReader dca.OpusReader
-	if p.PreEncoded {
-		opusReader = dca.NewDecoder(p.Reader)
-	} else {
-		resp, err := http.Get(p.URL)
-		if err != nil {
-			log.Printf("error request url %v", err)
-		}
-		log.Printf("resp %#v", resp)
-		defer resp.Body.Close()
-		opts := defaultEncodeOptions
-		if 0 < p.Volume && p.Volume < 256 {
-			opts.Volume = p.Volume
-		}
-		encoder, err := dca.EncodeMem(resp.Body, &opts)
-		if err != nil {
-			log.Printf("error encoding audio %v", err)
-			return
-		}
-		defer encoder.Cleanup()
-		opusReader = encoder
-	}
-
-	frameSize := opusReader.FrameDuration()
-	log.Printf("frame size %v", frameSize)
+	defer func() {
+		log.Printf("read %v of %v, expected %v", time.Duration(frameCount)*frameSize, s.title, s.duration)
+	}()
 
 	drain(play.control)
+
 	vc.Speaking(true)
 	defer vc.Speaking(false)
-
-	if p.Name != "" {
-		setStatus("🔊 " + p.Name)
-		defer setStatus("")
-	}
 
 	for {
 		select {
@@ -190,7 +220,15 @@ func sendPayload(play *Player, p *Payload, setStatus func(string), vc *discordgo
 
 		// TODO figure out a way to impl pause without repeating select block
 		if paused {
-			setStatus("⏸️ " + p.Name)
+
+			// send a status on pause
+			status.Playing = false
+			status.Elapsed = time.Duration(frameCount) * frameSize
+			select {
+			case s.status <- status:
+			default:
+			}
+
 			select {
 			case <-play.quit:
 				return
@@ -200,8 +238,14 @@ func sendPayload(play *Player, p *Payload, setStatus func(string), vc *discordgo
 					return
 				case pause:
 					paused = !paused
-					setStatus("🔊 " + p.Name)
 
+					// send a status on unpause
+					status.Playing = true
+					status.Elapsed = time.Duration(frameCount) * frameSize
+					select {
+					case s.status <- status:
+					default:
+					}
 				}
 			}
 		}
@@ -224,7 +268,41 @@ func sendPayload(play *Player, p *Payload, setStatus func(string), vc *discordgo
 			return
 		}
 
-		elapsed += frameSize
+		// send a status every n frames
+		// TODO client configurable rate
+		if frameCount%250 == 0 {
+			status.Playing = true
+			status.Elapsed = time.Duration(frameCount) * frameSize
+			select {
+			case s.status <- status:
+			default:
+			}
+		}
+
+		frameCount++
+	}
+}
+
+// wrap an opusreader around the song source
+func opusReader(s *song) (dca.OpusReader, func(), error) {
+	if s.preencoded {
+		return dca.NewDecoder(s.reader), func() {}, nil
+	} else {
+		resp, err := http.Get(s.url)
+		if err != nil {
+			return nil, func() {}, err
+		}
+		log.Printf("resp %#v", resp)
+		opts := defaultEncodeOptions 
+		if 0 < s.volume && s.volume < 256 {
+			opts.Volume = s.volume
+		}
+		encoder, err := dca.EncodeMem(resp.Body, &opts)
+		if err != nil {
+			resp.Body.Close()
+			return nil, func() {}, err
+		}
+		return encoder, func() { resp.Body.Close(); encoder.Cleanup() }, err
 	}
 }
 

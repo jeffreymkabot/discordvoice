@@ -24,7 +24,6 @@ var DefaultConfig = PlayerConfig{
 	QueueLength:        100,
 	SendTimeout:        1000,
 	IdleTimeout:        300,
-	CanBroadcastStatus: false,
 }
 
 // PlayerConfig sets some behaviors of the Player
@@ -32,7 +31,6 @@ type PlayerConfig struct {
 	QueueLength        int  `toml:"queue_length"`
 	SendTimeout        int  `toml:"send_timeout"`
 	IdleTimeout        int  `toml:"afk_timeout"`
-	CanBroadcastStatus bool `toml:"broadcast_status"`
 }
 
 // PlayerOption
@@ -66,13 +64,7 @@ func IdleTimeout(n int) PlayerOption {
 	}
 }
 
-// CanBroadcastStatus
-func CanBroadcastStatus(b bool) PlayerOption {
-	return func(cfg *PlayerConfig) {
-		cfg.CanBroadcastStatus = b
-	}
-}
-
+// Player
 type Player struct {
 	// mutex to prevent concurrent attempts to enqueue to get around QueueLength
 	mu   sync.Mutex
@@ -83,14 +75,73 @@ type Player struct {
 	cfg     *PlayerConfig
 }
 
-// Enqueue puts an item at the end of the queue
-func (play *Player) Enqueue(p *Payload) error {
-	play.mu.Lock()
-	defer play.mu.Unlock()
-	if play.queue.Len() >= int64(play.cfg.QueueLength) {
-		return ErrFull
+// Connect launches a Player that dispatches voice to a discord guild
+// Since discord allows only one voice connection per guild, you should call Player.Quit before calling Connect again for the same guild
+func Connect(s *discordgo.Session, guildID string, idleChannelID string, opts ...PlayerOption) *Player {
+	cfg := DefaultConfig
+	for _, opt := range opts {
+		opt(&cfg)
 	}
-	return play.queue.Put(p)
+	// cfg no longer changes after applying any options
+	// don't need to use mutex to safely access its properties
+
+	quit := make(chan struct{})
+	queue := queue.New(int64(cfg.QueueLength))
+	go func() {
+		<-quit
+		items := queue.Dispose()
+		for _, item := range items {
+			if p, ok := item.(*song); ok {
+				// close p.status to free any listeners
+				// this won't panic because close is elsehwere only called on status chans of payloads taken out of queue
+				close(p.status)
+			}
+		}
+	}()
+	ctrl := make(chan control, 1)
+
+	player := &Player{
+		quit:    quit,
+		queue:   queue,
+		control: ctrl,
+		cfg:     &cfg,
+	}
+
+	go sender(player, s, guildID, idleChannelID)
+
+	return player
+}
+
+// Enqueue puts an item at the end of the queue
+func (play *Player) Enqueue(channelID string, url string, opts ...SongOption) (<-chan SongStatus, error) {
+	play.mu.Lock()
+	if play.queue.Len() >= int64(play.cfg.QueueLength) {
+		play.mu.Unlock()
+		return nil, ErrFull
+	}
+
+	status := make(chan SongStatus, 1)
+
+	p := &song{
+		channelID: channelID,
+		url:       url,
+		title:     url,
+		status:    status,
+	}
+
+	for _, opt := range opts {
+		opt(p)
+	}
+
+	err := play.queue.Put(p)
+	play.mu.Unlock()
+
+	if err != nil {
+		close(status)
+		return nil, err
+	}
+
+	return status, nil
 }
 
 // Length returns the number of items in the queue
@@ -98,11 +149,11 @@ func (play *Player) Length() int {
 	return int(play.queue.Len())
 }
 
-// Next returns the name of the next item in the queue
+// Next returns the title of the next item in the queue
 func (play *Player) Next() string {
 	if item, err := play.queue.Peek(); err != nil {
-		if p, ok := item.(*Payload); ok {
-			return p.Name
+		if p, ok := item.(*song); ok {
+			return p.title
 		}
 	}
 	return ""
@@ -117,6 +168,22 @@ func (play *Player) Skip() error {
 		return ErrFull
 	}
 	return nil
+}
+
+// Clear removes all items from the queue
+// Clear does not skip the current song
+func (play *Player) Clear() error {
+	// doesn't need a lock because queue has its own internal lock
+	items, err := play.queue.TakeUntil(func(i interface{}) bool { return true })
+	for _, item := range items {
+		if p, ok := item.(*song); ok {
+			// close p.status to free any listeners
+			// this won't panic because close is elsehwere only called on status chans of payloads taken out of queue
+			// and every take uses the queue's internal lock
+			close(p.status)
+		}
+	}
+	return err
 }
 
 // Pause stops the currently playing item or resumes the currently paused item
@@ -140,33 +207,4 @@ func (play *Player) Quit() {
 	default:
 		close(play.quit)
 	}
-}
-
-// Connect launches a Player that dispatches voice to a discord guild
-// Since discord allows only one voice connection per guild, you should call Player.Quit before calling Connect again for the same guild
-func Connect(s *discordgo.Session, guildID string, idleChannelID string, opts ...PlayerOption) *Player {
-	cfg := DefaultConfig
-	for _, opt := range opts {
-		opt(&cfg)
-	}
-	// cfg no longer changes after applying any options
-
-	quit := make(chan struct{})
-	queue := queue.New(int64(cfg.QueueLength))
-	go func() {
-		<-quit
-		queue.Dispose()
-	}()
-	ctrl := make(chan control, 1)
-
-	send := &Player{
-		quit:    quit,
-		queue:   queue,
-		control: ctrl,
-		cfg:     &cfg,
-	}
-
-	go payloadSender(send, s, guildID, idleChannelID)
-
-	return send
 }
