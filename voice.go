@@ -1,11 +1,9 @@
 package discordvoice
 
 import (
-	"errors"
 	"io"
 	"log"
 	"net/http"
-	"sync"
 	"time"
 
 	"github.com/Workiva/go-datastructures/queue"
@@ -13,64 +11,24 @@ import (
 	"github.com/jonas747/dca"
 )
 
-const version = "0.0.1"
+const Version = "0.0.2"
 
-// VoiceConfig
-type VoiceConfig struct {
-	QueueLength        int `toml:"queue_length"`
-	SendTimeout        int `toml:"send_timeout"`
-	IdleTimeout        int `toml:"afk_timeout"`
-	CanBroadcastStatus bool
+var defaultEncodeOptions = dca.EncodeOptions{
+	Volume:           256,
+	Channels:         2,
+	FrameRate:        48000,
+	FrameDuration:    20,
+	Bitrate:          128,
+	RawOutput:        false,
+	Application:      dca.AudioApplicationAudio,
+	CompressionLevel: 10,
+	PacketLoss:       1,
+	BufferedFrames:   100,
+	VBR:              false,
+	AudioFilter:      "",
 }
 
-var DefaultConfig = VoiceConfig{
-	QueueLength: 100,
-	SendTimeout: 1000,
-	IdleTimeout: 300,
-}
-
-type VoiceOption func(*VoiceConfig)
-
-// QueueLength sets the maximum number of items that will be allowed in the queue
-func QueueLength(n int) VoiceOption {
-	return func(cfg *VoiceConfig) {
-		if n > 0 {
-			cfg.QueueLength = n
-		}
-	}
-}
-
-func SendTimeout(n int) VoiceOption {
-	return func(cfg *VoiceConfig) {
-		if n > 0 {
-			cfg.SendTimeout = n
-		}
-	}
-}
-
-func IdleTimeout(n int) VoiceOption {
-	return func(cfg *VoiceConfig) {
-		if n > 0 {
-			cfg.IdleTimeout = n
-		}
-	}
-}
-
-func CanBroadcastStatus(b bool) VoiceOption {
-	return func(cfg *VoiceConfig) {
-		cfg.CanBroadcastStatus = b
-	}
-}
-
-type control uint8
-
-const (
-	nop control = iota
-	skip
-	pause
-)
-
-// Payload
+// Payload 
 type Payload struct {
 	PreEncoded bool
 	Reader     io.Reader
@@ -79,105 +37,6 @@ type Payload struct {
 	Volume     int
 	Name       string
 	Duration   time.Duration
-}
-
-var ErrSendFull = errors.New("Full send buffer")
-
-type Player struct {
-	// mutex to prevent concurrent attempts to enqueue to get around QueueLength
-	mu   sync.Mutex
-	quit chan struct{}
-	// can't use a ringbuffer since it's bugged and uses all the cpu
-	queue   *queue.Queue
-	control chan control
-	cfg     *VoiceConfig
-}
-
-// Enqueue puts an item at the end of the queue
-func (play *Player) Enqueue(p *Payload) error {
-	play.mu.Lock()
-	defer play.mu.Unlock()
-	if play.queue.Len() >= int64(play.cfg.QueueLength) {
-		return ErrSendFull
-	}
-	return play.queue.Put(p)
-}
-
-// Length returns the number of items in the queue
-func (play *Player) Length() int {
-	return int(play.queue.Len())
-}
-
-// Next returns the name of the next item in the queue
-func (play *Player) Next() string {
-	if item, err := play.queue.Peek(); err != nil {
-		if p, ok := item.(*Payload); ok {
-			return p.Name
-		}
-	}
-	return ""
-}
-
-// Skip moves to the next item in the queue when an item is playing or is paused
-// Skip does nothing when there is no item in the queue or the player is already processing a control
-func (play *Player) Skip() error {
-	select {
-	case play.control <- skip:
-	default:
-		return ErrSendFull
-	}
-	return nil
-}
-
-// Pause stops the currently playing item or resumes the currently paused item
-// Pause does nothing when there is no item in the queue or the player is already processing a control
-func (play *Player) Pause() error {
-	select {
-	case play.control <- pause:
-	default:
-		return ErrSendFull
-	}
-	return nil
-}
-
-// Quit closes the player
-// You should call quit before calling connect again for the same guild
-func (play *Player) Quit() {
-	select {
-	case <-play.quit:
-		// already closed, don't close a closed channel
-		return
-	default:
-		close(play.quit)
-	}
-}
-
-// Connect launches a Player that dispatches voice to a discord guild
-// Since discord allows only one voice connection per guild, you should call Player.Quit before calling connect again for the same guild
-func Connect(s *discordgo.Session, guildID string, idleChannelID string, opts ...VoiceOption) *Player {
-	cfg := DefaultConfig
-	for _, opt := range opts {
-		opt(&cfg)
-	}
-
-	quit := make(chan struct{})
-	queue := queue.New(int64(cfg.QueueLength))
-	go func() {
-		<-quit
-		queue.Dispose()
-	}()
-	ctrl := make(chan control, 1)
-
-	send := &Player{
-		quit:    quit,
-		queue:   queue,
-		control: ctrl,
-		cfg:     &cfg,
-	}
-
-	go payloadSender(send, s, guildID, idleChannelID, cfg.CanBroadcastStatus, cfg.SendTimeout, cfg.IdleTimeout)
-
-	return send
 }
 
 func payloadSender(play *Player, s *discordgo.Session, guildID string, idleChannelID string, canSetStatus bool, sendTimeout int, idleTimeout int) {
@@ -262,21 +121,6 @@ func payloadSender(play *Player, s *discordgo.Session, guildID string, idleChann
 		}
 		pollTimeout = time.Duration(idleTimeout) * time.Millisecond
 	}
-}
-
-var defaultEncodeOptions = dca.EncodeOptions{
-	Volume:           256,
-	Channels:         2,
-	FrameRate:        48000,
-	FrameDuration:    20,
-	Bitrate:          128,
-	RawOutput:        false,
-	Application:      dca.AudioApplicationAudio,
-	CompressionLevel: 10,
-	PacketLoss:       1,
-	BufferedFrames:   100,
-	VBR:              false,
-	AudioFilter:      "",
 }
 
 func sendPayload(play *Player, p *Payload, setStatus func(string), vc *discordgo.VoiceConnection, sendTimeout int) {
