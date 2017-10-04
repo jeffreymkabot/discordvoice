@@ -82,7 +82,7 @@ type SongStatus struct {
 }
 
 func sender(player *Player, session *discordgo.Session, guildID string, idleChannelID string) {
-	if player.quit == nil || player.queue == nil || player.queue.Disposed() {
+	if player.queue == nil || player.queue.Disposed() {
 		return
 	}
 
@@ -93,7 +93,8 @@ func sender(player *Player, session *discordgo.Session, guildID string, idleChan
 	var s *song
 	var ok bool
 
-	pollTimeout := time.Duration(player.cfg.IdleTimeout) * time.Millisecond // isIdle := pollTimeout == 0
+	// isIdle := pollTimeout == 0
+	pollTimeout := time.Duration(player.cfg.IdleTimeout) * time.Millisecond
 
 	// join interacts with vc in closure
 	// join("") to disconnect
@@ -136,7 +137,7 @@ func sender(player *Player, session *discordgo.Session, guildID string, idleChan
 			}
 			continue
 		} else if err != nil {
-			// disposed
+			// disposed, play.Quit() was called
 			return
 		} else if len(items) != 1 {
 			// should not be possible, but avoid a panic just in case
@@ -181,11 +182,21 @@ func sendSong(play *Player, s *song, vc *discordgo.VoiceConnection) {
 	frameSize = opusReader.FrameDuration()
 
 	status := SongStatus{
-		Title: s.title,
+		Title:    s.title,
 		Duration: s.duration,
-		Playing: true,
-		Elapsed: 0,
+		Playing:  true,
+		Elapsed:  0,
 	}
+	sendStatus := func() {
+		status.Playing = !paused
+		status.Elapsed = time.Duration(frameCount) * frameSize
+		select {
+		case s.status <- status:
+		default:
+		}
+	}
+
+	sendTimeout := time.Duration(time.Duration(play.cfg.SendTimeout) * time.Millisecond)
 
 	// send a status on start
 	select {
@@ -206,9 +217,11 @@ func sendSong(play *Player, s *song, vc *discordgo.VoiceConnection) {
 
 	for {
 		select {
-		case <-play.quit:
-			return
-		case c, _ := <-play.control:
+		case c, ok := <-play.control:
+			if !ok {
+				// play.Quit was called
+				return
+			}
 			switch c {
 			case skip:
 				return
@@ -218,34 +231,23 @@ func sendSong(play *Player, s *song, vc *discordgo.VoiceConnection) {
 		default:
 		}
 
-		// TODO figure out a way to impl pause without repeating select block
+		// pause impl is same select as above with no default and status updates on pause/resume
+		// FIXME is it possible to impl pause without repeating select block
 		if paused {
-
-			// send a status on pause
-			status.Playing = false
-			status.Elapsed = time.Duration(frameCount) * frameSize
-			select {
-			case s.status <- status:
-			default:
-			}
+			sendStatus()
 
 			select {
-			case <-play.quit:
-				return
-			case c, _ := <-play.control:
+			case c, ok := <-play.control:
+				if !ok {
+					// play.Quit was called
+					return
+				}
 				switch c {
 				case skip:
 					return
 				case pause:
 					paused = !paused
-
-					// send a status on unpause
-					status.Playing = true
-					status.Elapsed = time.Duration(frameCount) * frameSize
-					select {
-					case s.status <- status:
-					default:
-					}
+					sendStatus()
 				}
 			}
 		}
@@ -260,10 +262,8 @@ func sendSong(play *Player, s *song, vc *discordgo.VoiceConnection) {
 		}
 
 		select {
-		case <-play.quit:
-			return
 		case vc.OpusSend <- frame:
-		case <-time.After(time.Duration(play.cfg.SendTimeout) * time.Millisecond):
+		case <-time.After(sendTimeout):
 			log.Printf("send timeout on %#v", vc)
 			return
 		}
@@ -271,12 +271,7 @@ func sendSong(play *Player, s *song, vc *discordgo.VoiceConnection) {
 		// send a status every n frames
 		// TODO client configurable rate
 		if frameCount%250 == 0 {
-			status.Playing = true
-			status.Elapsed = time.Duration(frameCount) * frameSize
-			select {
-			case s.status <- status:
-			default:
-			}
+			sendStatus()
 		}
 
 		frameCount++
@@ -293,7 +288,7 @@ func opusReader(s *song) (dca.OpusReader, func(), error) {
 			return nil, func() {}, err
 		}
 		log.Printf("resp %#v", resp)
-		opts := defaultEncodeOptions 
+		opts := defaultEncodeOptions
 		if 0 < s.volume && s.volume < 256 {
 			opts.Volume = s.volume
 		}

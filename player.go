@@ -21,16 +21,16 @@ var ErrFull = errors.New("Full send buffer")
 
 // DefaultConfig is the config that is used when no PlayerOptions are passed to Connect
 var DefaultConfig = PlayerConfig{
-	QueueLength:        100,
-	SendTimeout:        1000,
-	IdleTimeout:        300,
+	QueueLength: 100,
+	SendTimeout: 1000,
+	IdleTimeout: 300,
 }
 
 // PlayerConfig sets some behaviors of the Player
 type PlayerConfig struct {
-	QueueLength        int  `toml:"queue_length"`
-	SendTimeout        int  `toml:"send_timeout"`
-	IdleTimeout        int  `toml:"afk_timeout"`
+	QueueLength int `toml:"queue_length"`
+	SendTimeout int `toml:"send_timeout"`
+	IdleTimeout int `toml:"afk_timeout"`
 }
 
 // PlayerOption
@@ -66,9 +66,8 @@ func IdleTimeout(n int) PlayerOption {
 
 // Player
 type Player struct {
-	// mutex to prevent concurrent attempts to enqueue to get around QueueLength
-	mu   sync.Mutex
-	quit chan struct{}
+	// mutex to prevent concurrent invocations of enqueue from getting around QueueLength
+	mu sync.Mutex
 	// can't use a ringbuffer since it's bugged and uses all the cpu
 	queue   *queue.Queue
 	control chan control
@@ -85,23 +84,10 @@ func Connect(s *discordgo.Session, guildID string, idleChannelID string, opts ..
 	// cfg no longer changes after applying any options
 	// don't need to use mutex to safely access its properties
 
-	quit := make(chan struct{})
 	queue := queue.New(int64(cfg.QueueLength))
-	go func() {
-		<-quit
-		items := queue.Dispose()
-		for _, item := range items {
-			if p, ok := item.(*song); ok {
-				// close p.status to free any listeners
-				// this won't panic because close is elsehwere only called on status chans of payloads taken out of queue
-				close(p.status)
-			}
-		}
-	}()
 	ctrl := make(chan control, 1)
 
 	player := &Player{
-		quit:    quit,
 		queue:   queue,
 		control: ctrl,
 		cfg:     &cfg,
@@ -173,7 +159,8 @@ func (play *Player) Skip() error {
 // Clear removes all items from the queue
 // Clear does not skip the current song
 func (play *Player) Clear() error {
-	// doesn't need a lock because queue has its own internal lock
+	// doesn't need to use player lock because queue has its own internal lock
+	// i.e. play.queue.Put will block until this is done
 	items, err := play.queue.TakeUntil(func(i interface{}) bool { return true })
 	for _, item := range items {
 		if p, ok := item.(*song); ok {
@@ -200,11 +187,18 @@ func (play *Player) Pause() error {
 // Quit closes the player
 // You should call quit before calling connect again for the same guild
 func (play *Player) Quit() {
-	select {
-	case <-play.quit:
-		// already closed, don't close a closed channel
+	if play.queue.Disposed() {
 		return
-	default:
-		close(play.quit)
 	}
+
+	items := play.queue.Dispose()
+	for _, item := range items {
+		if p, ok := item.(*song); ok {
+			// close p.status to free any listeners
+			// this won't panic because close is elsehwere only called on status chans of payloads taken out of queue
+			close(p.status)
+		}
+	}
+	//
+	close(play.control)
 }
