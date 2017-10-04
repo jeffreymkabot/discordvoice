@@ -106,6 +106,10 @@ func (play *Player) Enqueue(channelID string, url string, opts ...SongOption) (<
 		return nil, ErrFull
 	}
 
+	// TODO callbacks instead of status
+	// onPause
+	// onResume
+	// onEnd
 	status := make(chan SongStatus, 1)
 
 	p := &song{

@@ -3,6 +3,7 @@ package discordvoice
 import (
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"time"
 
@@ -258,6 +259,17 @@ func sendSong(play *Player, s *song, vc *discordgo.VoiceConnection) {
 		frame, err = opusReader.OpusFrame()
 		if err != nil {
 			log.Printf("error reading frame %v", err)
+			// see if this was significantly before the expected end of the song
+			deviation := s.duration - time.Duration(frameCount)*frameSize
+			if deviation < 0 {
+				deviation *= -1
+			}
+			if s.duration > 0 && deviation > time.Second {
+				log.Print("early EOF :(")
+				if enc, ok := opusReader.(*dca.EncodeSession); ok {
+					log.Printf("ffmpegout %#v", enc.FFMPEGMessages())
+				}
+			}
 			return
 		}
 
