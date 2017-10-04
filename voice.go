@@ -3,7 +3,6 @@ package discordvoice
 import (
 	"io"
 	"log"
-	"math"
 	"net/http"
 	"time"
 
