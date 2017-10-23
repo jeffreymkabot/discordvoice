@@ -1,6 +1,7 @@
 package discordvoice
 
 import (
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -33,41 +34,55 @@ type SongOption func(*song)
 
 // PreEncoded
 func PreEncoded(r io.Reader) SongOption {
-	return func(p *song) {
-		p.preencoded = true
-		p.reader = r
+	return func(s *song) {
+		s.preencoded = true
+		s.reader = r
 	}
 }
 
-// Volume (0, 256], default 256
-func Volume(v int) SongOption {
-	return func(p *song) {
-		p.volume = v
+// Filter ffmpeg audio filter string
+func Filter(af string) SongOption {
+	return func(s *song) {
+		s.filters = af
+	}
+}
+
+// Limiter loundnorm ffmpeg audio filter
+// applied at end of any filterchain
+// -70.0 to -5.0, higher is louder
+func Limiter(f float64) SongOption {
+	return func(s *song) {
+		s.loudness = f
 	}
 }
 
 // Title tells the player the song is named something other than its url
-func Title(s string) SongOption {
-	return func(p *song) {
-		p.title = s
+func Title(t string) SongOption {
+	return func(s *song) {
+		s.title = t
 	}
 }
 
 // Duration lets the player know how long it should expect the song to be
 func Duration(d time.Duration) SongOption {
-	return func(p *song) {
-		p.duration = d
+	return func(s *song) {
+		s.duration = d
 	}
 }
 
 type song struct {
+	channelID string
+
+	url string
+
 	preencoded bool
 	reader     io.Reader
-	url        string
-	channelID  string
-	volume     int
-	title      string
-	duration   time.Duration
+
+	filters  string
+	loudness float64
+
+	title    string
+	duration time.Duration
 	// signal start, pause, done, elapsed
 	// pass values, not pointers
 	status chan<- SongStatus
@@ -232,7 +247,7 @@ func sendSong(play *Player, s *song, vc *discordgo.VoiceConnection) {
 		}
 
 		// pause impl is same select as above with no default and status updates on pause/resume
-		// FIXME is it possible to impl pause without repeating select block
+		// TODO is it possible to impl pause without repeating select block
 		if paused {
 			sendStatus()
 
@@ -300,8 +315,12 @@ func opusReader(s *song) (dca.OpusReader, func(), error) {
 		}
 		log.Printf("resp %#v", resp)
 		opts := defaultEncodeOptions
-		if 0 < s.volume && s.volume < 256 {
-			opts.Volume = s.volume
+		opts.AudioFilter = s.filters
+		if s.loudness != 0 {
+			if opts.AudioFilter != "" {
+				opts.AudioFilter += ", "
+			}
+			opts.AudioFilter += fmt.Sprintf("loudnorm=i=%.1f", s.loudness)
 		}
 		encoder, err := dca.EncodeMem(resp.Body, &opts)
 		if err != nil {
