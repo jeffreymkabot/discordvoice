@@ -107,17 +107,22 @@ func (play *Player) Enqueue(channelID string, url string, opts ...SongOption) er
 		return ErrFull
 	}
 
-	p := &song{
-		channelID: channelID,
-		url:       url,
-		title:     url,
+	s := &song{
+		channelID:  channelID,
+		url:        url,
+		title:      url,
+		onStart:    func() {},
+		onEnd:      func(time.Duration, error) {},
+		onProgress: func(time.Duration) {},
+		onPause:    func(time.Duration) {},
+		onResume:   func(time.Duration) {},
 	}
 
 	for _, opt := range opts {
-		opt(p)
+		opt(s)
 	}
 
-	err := play.queue.Put(p)
+	err := play.queue.Put(s)
 	play.mu.Unlock()
 
 	return err

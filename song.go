@@ -49,34 +49,44 @@ func Duration(d time.Duration) SongOption {
 
 func OnStart(f func()) SongOption {
 	return func(s *song) {
-		s.onStart = f
+		if f != nil {
+			s.onStart = f
+		}
 	}
 }
 
 // OnEnd
 func OnEnd(f func(elapsed time.Duration, err error)) SongOption {
 	return func(s *song) {
-		s.onEnd = f
+		if f != nil {
+			s.onEnd = f
+		}
 	}
 }
 
 // OnProgress interval is approximate, will be quantized to a multiple of frame duration
 func OnProgress(f func(elapsed time.Duration), interval time.Duration) SongOption {
 	return func(s *song) {
-		s.onProgress = f
-		s.progressInterval = interval
+		if f != nil {
+			s.onProgress = f
+			s.progressInterval = interval
+		}
 	}
 }
 
 func OnPause(f func(elapsed time.Duration)) SongOption {
 	return func(s *song) {
-		s.onPause = f
+		if f != nil {
+			s.onPause = f
+		}
 	}
 }
 
 func OnResume(f func(elapsed time.Duration)) SongOption {
 	return func(s *song) {
-		s.onResume = f
+		if f != nil {
+			s.onResume = f
+		}
 	}
 }
 
