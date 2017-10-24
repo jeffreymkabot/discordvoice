@@ -99,24 +99,17 @@ func Connect(s *discordgo.Session, guildID string, idleChannelID string, opts ..
 }
 
 // Enqueue puts an item at the end of the queue
-func (play *Player) Enqueue(channelID string, url string, opts ...SongOption) (<-chan SongStatus, error) {
+func (play *Player) Enqueue(channelID string, url string, opts ...SongOption) error {
 	play.mu.Lock()
 	if play.queue.Len() >= int64(play.cfg.QueueLength) {
 		play.mu.Unlock()
-		return nil, ErrFull
+		return ErrFull
 	}
-
-	// TODO callbacks instead of status
-	// onPause
-	// onResume
-	// onEnd
-	status := make(chan SongStatus, 1)
 
 	p := &song{
 		channelID: channelID,
 		url:       url,
 		title:     url,
-		status:    status,
 	}
 
 	for _, opt := range opts {
@@ -126,12 +119,7 @@ func (play *Player) Enqueue(channelID string, url string, opts ...SongOption) (<
 	err := play.queue.Put(p)
 	play.mu.Unlock()
 
-	if err != nil {
-		close(status)
-		return nil, err
-	}
-
-	return status, nil
+	return err
 }
 
 // Length returns the number of items in the queue
@@ -168,10 +156,11 @@ func (play *Player) Clear() error {
 	items, err := play.queue.TakeUntil(func(i interface{}) bool { return true })
 	for _, item := range items {
 		if p, ok := item.(*song); ok {
+			p.onEnd()
 			// close p.status to free any listeners
 			// this won't panic because close is elsehwere only called on status chans of payloads taken out of queue
 			// and every take uses the queue's internal lock
-			close(p.status)
+			// close(p.status)
 		}
 	}
 	return err
@@ -198,9 +187,10 @@ func (play *Player) Quit() {
 	items := play.queue.Dispose()
 	for _, item := range items {
 		if p, ok := item.(*song); ok {
+			p.onEnd()
 			// close p.status to free any listeners
 			// this won't panic because close is elsehwere only called on status chans of payloads taken out of queue
-			close(p.status)
+			// close(p.status)
 		}
 	}
 	//

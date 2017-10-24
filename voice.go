@@ -2,7 +2,6 @@ package discordvoice
 
 import (
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"time"
@@ -27,73 +26,6 @@ var defaultEncodeOptions = dca.EncodeOptions{
 	BufferedFrames:   100,
 	VBR:              false,
 	AudioFilter:      "",
-}
-
-// SongOption
-type SongOption func(*song)
-
-// PreEncoded
-func PreEncoded(r io.Reader) SongOption {
-	return func(s *song) {
-		s.preencoded = true
-		s.reader = r
-	}
-}
-
-// Filter ffmpeg audio filter string
-func Filter(af string) SongOption {
-	return func(s *song) {
-		s.filters = af
-	}
-}
-
-// Limiter loundnorm ffmpeg audio filter
-// applied at end of any filterchain
-// -70.0 to -5.0, higher is louder
-func Limiter(f float64) SongOption {
-	return func(s *song) {
-		s.loudness = f
-	}
-}
-
-// Title tells the player the song is named something other than its url
-func Title(t string) SongOption {
-	return func(s *song) {
-		s.title = t
-	}
-}
-
-// Duration lets the player know how long it should expect the song to be
-func Duration(d time.Duration) SongOption {
-	return func(s *song) {
-		s.duration = d
-	}
-}
-
-type song struct {
-	channelID string
-
-	url string
-
-	preencoded bool
-	reader     io.Reader
-
-	filters  string
-	loudness float64
-
-	title    string
-	duration time.Duration
-	// signal start, pause, done, elapsed
-	// pass values, not pointers
-	status chan<- SongStatus
-}
-
-// SongStatus
-type SongStatus struct {
-	Playing  bool
-	Title    string
-	Elapsed  time.Duration
-	Duration time.Duration
 }
 
 func sender(player *Player, session *discordgo.Session, guildID string, idleChannelID string) {
@@ -170,11 +102,10 @@ func sender(player *Player, session *discordgo.Session, guildID string, idleChan
 		err = join(s.channelID)
 		if err != nil {
 			log.Printf("error join payload channel %v", err)
-			close(s.status)
 		} else {
 			sendSong(player, s, vc)
-			close(s.status)
 		}
+		s.onEnd()
 		pollTimeout = time.Duration(player.cfg.IdleTimeout) * time.Millisecond
 	}
 }
@@ -186,6 +117,8 @@ func sendSong(play *Player, s *song, vc *discordgo.VoiceConnection) {
 	var frameCount int
 	var frameSize time.Duration
 
+	var frameInterval int
+
 	log.Printf("begin send %v", s.title)
 
 	opusReader, cleanup, err := opusReader(s)
@@ -195,29 +128,11 @@ func sendSong(play *Player, s *song, vc *discordgo.VoiceConnection) {
 	}
 	defer cleanup()
 	frameSize = opusReader.FrameDuration()
-
-	status := SongStatus{
-		Title:    s.title,
-		Duration: s.duration,
-		Playing:  true,
-		Elapsed:  0,
-	}
-	sendStatus := func() {
-		status.Playing = !paused
-		status.Elapsed = time.Duration(frameCount) * frameSize
-		select {
-		case s.status <- status:
-		default:
-		}
+	if s.progressInterval > 0 {
+		frameInterval = int(s.progressInterval / frameSize)
 	}
 
 	sendTimeout := time.Duration(time.Duration(play.cfg.SendTimeout) * time.Millisecond)
-
-	// send a status on start
-	select {
-	case s.status <- status:
-	default:
-	}
 
 	// use an anonymous function so it reads the value of elapsed in its closure instead of in its paramters
 	// this way log.Printf prints the value of elapsed at the time it is executed rather than the time it is deferred
@@ -229,6 +144,8 @@ func sendSong(play *Player, s *song, vc *discordgo.VoiceConnection) {
 
 	vc.Speaking(true)
 	defer vc.Speaking(false)
+
+	s.onStart()
 
 	for {
 		select {
@@ -249,7 +166,7 @@ func sendSong(play *Player, s *song, vc *discordgo.VoiceConnection) {
 		// pause impl is same select as above with no default and status updates on pause/resume
 		// TODO is it possible to impl pause without repeating select block
 		if paused {
-			sendStatus()
+			s.onPause(time.Duration(frameCount) * frameSize)
 
 			select {
 			case c, ok := <-play.control:
@@ -262,7 +179,7 @@ func sendSong(play *Player, s *song, vc *discordgo.VoiceConnection) {
 					return
 				case pause:
 					paused = !paused
-					sendStatus()
+					s.onResume(time.Duration(frameCount) * frameSize)
 				}
 			}
 		}
@@ -295,9 +212,8 @@ func sendSong(play *Player, s *song, vc *discordgo.VoiceConnection) {
 		}
 
 		// send a status every n frames
-		// TODO client configurable rate
-		if frameCount%250 == 0 {
-			sendStatus()
+		if frameInterval > 0 && frameCount%frameInterval == 0 {
+			s.onProgress(time.Duration(frameCount) * frameSize)
 		}
 
 		frameCount++
@@ -308,27 +224,26 @@ func sendSong(play *Player, s *song, vc *discordgo.VoiceConnection) {
 func opusReader(s *song) (dca.OpusReader, func(), error) {
 	if s.preencoded {
 		return dca.NewDecoder(s.reader), func() {}, nil
-	} else {
-		resp, err := http.Get(s.url)
-		if err != nil {
-			return nil, func() {}, err
-		}
-		log.Printf("resp %#v", resp)
-		opts := defaultEncodeOptions
-		opts.AudioFilter = s.filters
-		if s.loudness != 0 {
-			if opts.AudioFilter != "" {
-				opts.AudioFilter += ", "
-			}
-			opts.AudioFilter += fmt.Sprintf("loudnorm=i=%.1f", s.loudness)
-		}
-		encoder, err := dca.EncodeMem(resp.Body, &opts)
-		if err != nil {
-			resp.Body.Close()
-			return nil, func() {}, err
-		}
-		return encoder, func() { resp.Body.Close(); encoder.Cleanup() }, err
 	}
+	resp, err := http.Get(s.url)
+	if err != nil {
+		return nil, func() {}, err
+	}
+	log.Printf("resp %#v", resp)
+	opts := defaultEncodeOptions
+	opts.AudioFilter = s.filters
+	if s.loudness != 0 {
+		if opts.AudioFilter != "" {
+			opts.AudioFilter += ", "
+		}
+		opts.AudioFilter += fmt.Sprintf("loudnorm=i=%.1f", s.loudness)
+	}
+	encoder, err := dca.EncodeMem(resp.Body, &opts)
+	if err != nil {
+		resp.Body.Close()
+		return nil, func() {}, err
+	}
+	return encoder, func() { resp.Body.Close(); encoder.Cleanup() }, err
 }
 
 func drain(c <-chan control) {
