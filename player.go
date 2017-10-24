@@ -3,6 +3,7 @@ package discordvoice
 import (
 	"errors"
 	"sync"
+	"time"
 
 	"github.com/Workiva/go-datastructures/queue"
 	"github.com/bwmarrin/discordgo"
@@ -16,7 +17,7 @@ const (
 	pause
 )
 
-// ErrFull is emitted when the Payload queue or control queue is full
+// ErrFull is emitted when the Payload queue is full
 var ErrFull = errors.New("Full send buffer")
 
 // DefaultConfig is the config that is used when no PlayerOptions are passed to Connect
@@ -85,7 +86,7 @@ func Connect(s *discordgo.Session, guildID string, idleChannelID string, opts ..
 	// don't need to use mutex to safely access its properties
 
 	queue := queue.New(int64(cfg.QueueLength))
-	ctrl := make(chan control, 1)
+	ctrl := make(chan control)
 
 	player := &Player{
 		queue:   queue,
@@ -130,8 +131,8 @@ func (play *Player) Length() int {
 // Next returns the title of the next item in the queue
 func (play *Player) Next() string {
 	if item, err := play.queue.Peek(); err != nil {
-		if p, ok := item.(*song); ok {
-			return p.title
+		if s, ok := item.(*song); ok {
+			return s.title
 		}
 	}
 	return ""
@@ -142,7 +143,7 @@ func (play *Player) Next() string {
 func (play *Player) Skip() error {
 	select {
 	case play.control <- skip:
-	default:
+	case <-time.After(1 * time.Second):
 		return ErrFull
 	}
 	return nil
@@ -155,12 +156,8 @@ func (play *Player) Clear() error {
 	// i.e. play.queue.Put will block until this is done
 	items, err := play.queue.TakeUntil(func(i interface{}) bool { return true })
 	for _, item := range items {
-		if p, ok := item.(*song); ok {
-			p.onEnd()
-			// close p.status to free any listeners
-			// this won't panic because close is elsehwere only called on status chans of payloads taken out of queue
-			// and every take uses the queue's internal lock
-			// close(p.status)
+		if s, ok := item.(*song); ok {
+			s.onEnd(0, errors.New("cleared"))
 		}
 	}
 	return err
@@ -171,7 +168,7 @@ func (play *Player) Clear() error {
 func (play *Player) Pause() error {
 	select {
 	case play.control <- pause:
-	default:
+	case <-time.After(1 * time.Second):
 		return ErrFull
 	}
 	return nil
@@ -186,11 +183,8 @@ func (play *Player) Quit() {
 
 	items := play.queue.Dispose()
 	for _, item := range items {
-		if p, ok := item.(*song); ok {
-			p.onEnd()
-			// close p.status to free any listeners
-			// this won't panic because close is elsehwere only called on status chans of payloads taken out of queue
-			// close(p.status)
+		if s, ok := item.(*song); ok {
+			s.onEnd(0, errors.New("quit"))
 		}
 	}
 	//

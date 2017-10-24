@@ -9,9 +9,10 @@ import (
 	"github.com/Workiva/go-datastructures/queue"
 	"github.com/bwmarrin/discordgo"
 	"github.com/jonas747/dca"
+	"github.com/pkg/errors"
 )
 
-const Version = "0.1.0"
+const Version = "0.2.0"
 
 var defaultEncodeOptions = dca.EncodeOptions{
 	Volume:           256,
@@ -101,16 +102,15 @@ func sender(player *Player, session *discordgo.Session, guildID string, idleChan
 
 		err = join(s.channelID)
 		if err != nil {
-			log.Printf("error join payload channel %v", err)
+			s.onEnd(0, errors.Wrap(err, "failed to join song channel"))
 		} else {
-			sendSong(player, s, vc)
+			s.onEnd(sendSong(player, s, vc))
 		}
-		s.onEnd()
 		pollTimeout = time.Duration(player.cfg.IdleTimeout) * time.Millisecond
 	}
 }
 
-func sendSong(play *Player, s *song, vc *discordgo.VoiceConnection) {
+func sendSong(play *Player, s *song, vc *discordgo.VoiceConnection) (time.Duration, error) {
 	var paused bool
 	var frame []byte
 
@@ -119,28 +119,18 @@ func sendSong(play *Player, s *song, vc *discordgo.VoiceConnection) {
 
 	var frameInterval int
 
-	log.Printf("begin send %v", s.title)
-
 	opusReader, cleanup, err := opusReader(s)
 	if err != nil {
-		log.Printf("error streaming file %v", err)
-		return
+		return 0, errors.Wrap(err, "failed to stream url / file")
 	}
 	defer cleanup()
+
 	frameSize = opusReader.FrameDuration()
 	if s.progressInterval > 0 {
 		frameInterval = int(s.progressInterval / frameSize)
 	}
 
 	sendTimeout := time.Duration(time.Duration(play.cfg.SendTimeout) * time.Millisecond)
-
-	// use an anonymous function so it reads the value of elapsed in its closure instead of in its paramters
-	// this way log.Printf prints the value of elapsed at the time it is executed rather than the time it is deferred
-	defer func() {
-		log.Printf("read %v of %v, expected %v", time.Duration(frameCount)*frameSize, s.title, s.duration)
-	}()
-
-	drain(play.control)
 
 	vc.Speaking(true)
 	defer vc.Speaking(false)
@@ -151,36 +141,31 @@ func sendSong(play *Player, s *song, vc *discordgo.VoiceConnection) {
 		select {
 		case c, ok := <-play.control:
 			if !ok {
-				// play.Quit was called
-				return
+				return time.Duration(frameCount) * frameSize, errors.New("quit")
 			}
 			switch c {
 			case skip:
-				return
+				return time.Duration(frameCount) * frameSize, errors.New("skipped")
 			case pause:
 				paused = !paused
 			}
 		default:
 		}
 
-		// pause impl is same select as above with no default and status updates on pause/resume
-		// TODO is it possible to impl pause without repeating select block
+		// TODO is it possible to impl pause without repeating code
 		if paused {
 			s.onPause(time.Duration(frameCount) * frameSize)
 
-			select {
-			case c, ok := <-play.control:
-				if !ok {
-					// play.Quit was called
-					return
-				}
-				switch c {
-				case skip:
-					return
-				case pause:
-					paused = !paused
-					s.onResume(time.Duration(frameCount) * frameSize)
-				}
+			c, ok := <-play.control
+			if !ok {
+				return time.Duration(frameCount) * frameSize, errors.New("quit")
+			}
+			switch c {
+			case skip:
+				return time.Duration(frameCount) * frameSize, errors.New("skipped")
+			case pause:
+				paused = !paused
+				s.onResume(time.Duration(frameCount) * frameSize)
 			}
 		}
 
@@ -189,26 +174,24 @@ func sendSong(play *Player, s *song, vc *discordgo.VoiceConnection) {
 		// err is UnexpectedEOF if partial frame is read
 		frame, err = opusReader.OpusFrame()
 		if err != nil {
-			log.Printf("error reading frame %v", err)
 			// see if this was significantly before the expected end of the song
 			deviation := s.duration - time.Duration(frameCount)*frameSize
 			if deviation < 0 {
 				deviation *= -1
 			}
-			if s.duration > 0 && deviation > time.Second {
-				log.Print("early EOF :(")
+			if s.duration > 0 && deviation > 300*time.Millisecond {
 				if enc, ok := opusReader.(*dca.EncodeSession); ok {
-					log.Printf("ffmpegout %#v", enc.FFMPEGMessages())
+					err = errors.WithMessage(err, enc.FFMPEGMessages())
 				}
 			}
-			return
+			return time.Duration(frameCount) * frameSize, errors.Wrap(err, "failed to read frame")
 		}
 
 		select {
 		case vc.OpusSend <- frame:
+			// TODO record send timing to gather playback stability data
 		case <-time.After(sendTimeout):
-			log.Printf("send timeout on %#v", vc)
-			return
+			return time.Duration(frameCount) * frameSize, errors.Errorf("send timeout on voice connection %#v", vc)
 		}
 
 		// send a status every n frames
@@ -244,14 +227,4 @@ func opusReader(s *song) (dca.OpusReader, func(), error) {
 		return nil, func() {}, err
 	}
 	return encoder, func() { resp.Body.Close(); encoder.Cleanup() }, err
-}
-
-func drain(c <-chan control) {
-	for {
-		select {
-		case <-c:
-		default:
-			return
-		}
-	}
 }
