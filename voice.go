@@ -135,14 +135,24 @@ func sendSong(play *Player, s *song, vc *discordgo.VoiceConnection) (time.Durati
 	vc.Speaking(true)
 	defer vc.Speaking(false)
 
+	// lock prevents concurrent read of play.ctrl in Pause() / Skip()
+	play.mu.Lock()
+	play.ctrl = make(chan control, 1)
+	play.mu.Unlock()
+
+	defer func() {
+		play.mu.Lock()
+		play.ctrl = nil
+		play.mu.Unlock()
+	}()
+
 	s.onStart()
 
 	for {
 		select {
-		case c, ok := <-play.control:
-			if !ok {
-				return time.Duration(frameCount) * frameSize, errors.New("quit")
-			}
+		case <-play.quit:
+			return time.Duration(frameCount) * frameSize, errors.New("quit")
+		case c := <-play.ctrl:
 			switch c {
 			case skip:
 				return time.Duration(frameCount) * frameSize, errors.New("skipped")
@@ -156,16 +166,17 @@ func sendSong(play *Player, s *song, vc *discordgo.VoiceConnection) (time.Durati
 		if paused {
 			s.onPause(time.Duration(frameCount) * frameSize)
 
-			c, ok := <-play.control
-			if !ok {
+			select {
+			case <-play.quit:
 				return time.Duration(frameCount) * frameSize, errors.New("quit")
-			}
-			switch c {
-			case skip:
-				return time.Duration(frameCount) * frameSize, errors.New("skipped")
-			case pause:
-				paused = !paused
-				s.onResume(time.Duration(frameCount) * frameSize)
+			case c := <-play.ctrl:
+				switch c {
+				case skip:
+					return time.Duration(frameCount) * frameSize, errors.New("skipped")
+				case pause:
+					paused = !paused
+					s.onResume(time.Duration(frameCount) * frameSize)
+				}
 			}
 		}
 

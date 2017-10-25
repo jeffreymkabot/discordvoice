@@ -33,14 +33,14 @@ func Loudness(f float64) SongOption {
 	}
 }
 
-// Title tells the player the song is named something other than its url
+// Title tells the player the song is named something other than its url.
 func Title(t string) SongOption {
 	return func(s *song) {
 		s.title = t
 	}
 }
 
-// Duration lets the player know how long it should expect the song to be
+// Duration lets the player know how long it should expect the song to be.
 func Duration(d time.Duration) SongOption {
 	return func(s *song) {
 		s.duration = d
@@ -64,7 +64,7 @@ func OnEnd(f func(elapsed time.Duration, err error)) SongOption {
 	}
 }
 
-// OnProgress interval is approximate, will be quantized to a multiple of frame duration
+// OnProgress interval is approximate, will be quantized to a multiple of frame duration.
 func OnProgress(f func(elapsed time.Duration), interval time.Duration) SongOption {
 	return func(s *song) {
 		if f != nil {
