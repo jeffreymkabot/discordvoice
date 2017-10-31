@@ -136,7 +136,7 @@ func (play *Player) Length() int {
 
 // Next returns the title of the next item in the queue.
 func (play *Player) Next() string {
-	if item, err := play.queue.Peek(); err != nil {
+	if item, err := play.queue.Peek(); err == nil {
 		if s, ok := item.(*song); ok {
 			return s.title
 		}
@@ -165,13 +165,15 @@ func (play *Player) Clear() error {
 func (play *Player) Skip() error {
 	// lock prevents concurrent write to play.ctrl in sendSong
 	play.mu.Lock()
+	defer play.mu.Unlock()
+	if play.ctrl == nil {
+		return errors.New("nothing to skip")
+	}
 	select {
 	case play.ctrl <- skip:
 	default:
-		play.mu.Unlock()
-		return ErrFull
+		return errors.New("busy")
 	}
-	play.mu.Unlock()
 	return nil
 }
 
@@ -182,13 +184,15 @@ func (play *Player) Skip() error {
 func (play *Player) Pause() error {
 	// lock prevents concurrent write to play.ctrl in sendSong
 	play.mu.Lock()
+	defer play.mu.Unlock()
+	if play.ctrl == nil {
+		return errors.New("nothing to pause")
+	}
 	select {
 	case play.ctrl <- pause:
 	default:
-		play.mu.Unlock()
-		return ErrFull
+		return errors.New("busy")
 	}
-	play.mu.Unlock()
 	return nil
 }
 
