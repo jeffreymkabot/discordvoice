@@ -37,10 +37,6 @@ func sender(player *Player, session *discordgo.Session, guildID string, idleChan
 	var vc *discordgo.VoiceConnection
 	var err error
 
-	var items []interface{}
-	var s *song
-	var ok bool
-
 	// isIdle := pollTimeout == 0
 	pollTimeout := time.Duration(player.cfg.IdleTimeout) * time.Millisecond
 
@@ -76,7 +72,7 @@ func sender(player *Player, session *discordgo.Session, guildID string, idleChan
 	}
 
 	for {
-		items, err = player.queue.Poll(1, pollTimeout)
+		items, err := player.queue.Poll(1, pollTimeout)
 		if err == queue.ErrTimeout {
 			pollTimeout = 0
 			err = join(idleChannelID)
@@ -93,7 +89,7 @@ func sender(player *Player, session *discordgo.Session, guildID string, idleChan
 			continue
 		}
 
-		s, ok = items[0].(*song)
+		s, ok := items[0].(*song)
 		if !ok {
 			// should not be possible, but avoid a panic just in case
 			pollTimeout = time.Duration(player.cfg.IdleTimeout) * time.Millisecond
@@ -111,23 +107,19 @@ func sender(player *Player, session *discordgo.Session, guildID string, idleChan
 }
 
 func sendSong(play *Player, s *song, vc *discordgo.VoiceConnection) (time.Duration, error) {
-	var paused bool
-	var frame []byte
-
-	var frameCount int
-	var frameSize time.Duration
-
-	var frameInterval int
-
 	opusReader, cleanup, err := opusReader(s)
 	if err != nil {
 		return 0, errors.Wrap(err, "failed to stream url / file")
 	}
 	defer cleanup()
 
-	frameSize = opusReader.FrameDuration()
+	frameCount := 0
+	frameSize := opusReader.FrameDuration()
+	frameInterval := 0
+	var frameTimes []time.Time
 	if s.progressInterval > 0 {
 		frameInterval = int(s.progressInterval / frameSize)
+		frameTimes = make([]time.Time, frameInterval, frameInterval)
 	}
 
 	sendTimeout := time.Duration(time.Duration(play.cfg.SendTimeout) * time.Millisecond)
@@ -139,13 +131,13 @@ func sendSong(play *Player, s *song, vc *discordgo.VoiceConnection) (time.Durati
 	play.mu.Lock()
 	play.ctrl = make(chan control, 1)
 	play.mu.Unlock()
-
 	defer func() {
 		play.mu.Lock()
 		play.ctrl = nil
 		play.mu.Unlock()
 	}()
 
+	paused := false
 	s.onStart()
 
 	for {
@@ -183,7 +175,7 @@ func sendSong(play *Player, s *song, vc *discordgo.VoiceConnection) (time.Durati
 		// underlying impl is encoding/binary.Read
 		// err is EOF iff no bytes were read
 		// err is UnexpectedEOF if partial frame is read
-		frame, err = opusReader.OpusFrame()
+		frame, err := opusReader.OpusFrame()
 		if err != nil {
 			// see if this was significantly before the expected end of the song
 			deviation := s.duration - time.Duration(frameCount)*frameSize
@@ -198,16 +190,22 @@ func sendSong(play *Player, s *song, vc *discordgo.VoiceConnection) (time.Durati
 			return time.Duration(frameCount) * frameSize, errors.Wrap(err, "failed to read frame")
 		}
 
-		select {
-		case vc.OpusSend <- frame:
-			// TODO record send timing to gather playback stability data
-		case <-time.After(sendTimeout):
-			return time.Duration(frameCount) * frameSize, errors.Errorf("send timeout on voice connection %#v", vc)
+		// send a status every n frames
+		if frameInterval > 0 && frameCount > 0 && frameCount%frameInterval == 0 {
+			// careful frameTimes is pointer to array and if onProgress is async frameTimes will change while onProgress uses it
+			// TODO why are the first three frameTimes in every interval sometimes equal
+			cpy := make([]time.Time, len(frameTimes))
+			copy(cpy, frameTimes)
+			s.onProgress(time.Duration(frameCount)*frameSize, cpy)
 		}
 
-		// send a status every n frames
-		if frameInterval > 0 && frameCount%frameInterval == 0 {
-			s.onProgress(time.Duration(frameCount) * frameSize)
+		select {
+		case vc.OpusSend <- frame:
+			if frameInterval > 0 {
+				frameTimes[frameCount%frameInterval] = time.Now()
+			}
+		case <-time.After(sendTimeout):
+			return time.Duration(frameCount) * frameSize, errors.Errorf("send timeout on voice connection %#v", vc)
 		}
 
 		frameCount++

@@ -114,7 +114,7 @@ func (play *Player) Enqueue(channelID string, url string, opts ...SongOption) er
 		title:      url,
 		onStart:    func() {},
 		onEnd:      func(time.Duration, error) {},
-		onProgress: func(time.Duration) {},
+		onProgress: func(time.Duration, []time.Time) {},
 		onPause:    func(time.Duration) {},
 		onResume:   func(time.Duration) {},
 	}

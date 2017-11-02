@@ -65,7 +65,7 @@ func OnEnd(f func(elapsed time.Duration, err error)) SongOption {
 }
 
 // OnProgress interval is approximate, will be quantized to a multiple of frame duration.
-func OnProgress(f func(elapsed time.Duration), interval time.Duration) SongOption {
+func OnProgress(f func(elapsed time.Duration, frameTime []time.Time), interval time.Duration) SongOption {
 	return func(s *song) {
 		if f != nil {
 			s.onProgress = f
@@ -106,7 +106,7 @@ type song struct {
 
 	onStart          func()
 	onEnd            func(elapsed time.Duration, err error)
-	onProgress       func(elapsed time.Duration)
+	onProgress       func(elapsed time.Duration, frameTimes []time.Time)
 	progressInterval time.Duration
 	onPause          func(elapsed time.Duration)
 	onResume         func(elapsed time.Duration)
