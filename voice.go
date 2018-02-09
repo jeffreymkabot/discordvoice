@@ -3,7 +3,6 @@ package discordvoice
 import (
 	"fmt"
 	"log"
-	"net/http"
 	"time"
 
 	"github.com/Workiva/go-datastructures/queue"
@@ -12,7 +11,7 @@ import (
 	"github.com/pkg/errors"
 )
 
-const Version = "0.2.0"
+const Version = "0.3.0"
 
 var defaultEncodeOptions = dca.EncodeOptions{
 	Volume:           256,
@@ -193,7 +192,9 @@ func sendSong(play *Player, s *song, vc *discordgo.VoiceConnection) (time.Durati
 		// send a status every n frames
 		if frameInterval > 0 && frameCount > 0 && frameCount%frameInterval == 0 {
 			// careful frameTimes is pointer to array and if onProgress is async frameTimes will change while onProgress uses it
-			// TODO why are the first three frameTimes in every interval sometimes equal
+			// TODO why are the first three frameTimes in every frameInterval sometimes equal
+			// vc.OpusSend is buffered to length=2 but its read-interval is 20ms
+			// so I don't think copying here could delay three reads that the buffer clears
 			cpy := make([]time.Time, len(frameTimes))
 			copy(cpy, frameTimes)
 			s.onProgress(time.Duration(frameCount)*frameSize, cpy)
@@ -214,14 +215,15 @@ func sendSong(play *Player, s *song, vc *discordgo.VoiceConnection) (time.Durati
 
 // wrap an opusreader around the song source
 func opusReader(s *song) (dca.OpusReader, func(), error) {
-	if s.preencoded {
-		return dca.NewDecoder(s.reader), func() {}, nil
-	}
-	resp, err := http.Get(s.url)
+	readCloser, err := s.open()
 	if err != nil {
 		return nil, func() {}, err
 	}
-	log.Printf("resp %#v", resp)
+
+	if s.preencoded {
+		return dca.NewDecoder(readCloser), func() { readCloser.Close() }, nil
+	}
+
 	opts := defaultEncodeOptions
 	opts.AudioFilter = s.filters
 	if s.loudness != 0 {
@@ -230,10 +232,11 @@ func opusReader(s *song) (dca.OpusReader, func(), error) {
 		}
 		opts.AudioFilter += fmt.Sprintf("loudnorm=i=%.1f", s.loudness)
 	}
-	encoder, err := dca.EncodeMem(resp.Body, &opts)
+
+	encoder, err := dca.EncodeMem(readCloser, &opts)
 	if err != nil {
-		resp.Body.Close()
+		readCloser.Close()
 		return nil, func() {}, err
 	}
-	return encoder, func() { resp.Body.Close(); encoder.Cleanup() }, err
+	return encoder, func() { readCloser.Close(); encoder.Cleanup() }, err
 }

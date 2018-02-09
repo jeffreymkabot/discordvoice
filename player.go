@@ -100,7 +100,7 @@ func Connect(s *discordgo.Session, guildID string, idleChannelID string, opts ..
 }
 
 // Enqueue puts an item at the end of the queue.
-func (play *Player) Enqueue(channelID string, url string, opts ...SongOption) error {
+func (play *Player) Enqueue(channelID string, title string, songOpener SongOpener, opts ...SongOption) error {
 	// lock ensures concurrent calls to Enqueue do not get around QueueLength
 	play.mu.Lock()
 	if play.queue.Len() >= int64(play.cfg.QueueLength) {
@@ -110,8 +110,8 @@ func (play *Player) Enqueue(channelID string, url string, opts ...SongOption) er
 
 	s := &song{
 		channelID:  channelID,
-		url:        url,
-		title:      url,
+		open:       songOpener,
+		title:      title,
 		onStart:    func() {},
 		onEnd:      func(time.Duration, error) {},
 		onProgress: func(time.Duration, []time.Time) {},
@@ -159,7 +159,7 @@ func (play *Player) Clear() error {
 }
 
 // Skip moves to the next item in the queue when an item is playing or is paused.
-// Skip has no effect if no item is playing or is paused 
+// Skip has no effect if no item is playing or is paused
 // or if the player is already processing a skip or a pause for the current item.
 // i.e. you cannot queue up future skips/pauses.
 func (play *Player) Skip() error {
@@ -178,7 +178,7 @@ func (play *Player) Skip() error {
 }
 
 // Pause stops the currently playing item or resumes the currently paused item.
-// Pause has no effect if no item is playing or is paused 
+// Pause has no effect if no item is playing or is paused
 // or if the player is already processing a skip or a pause for the current item.
 // i.e. you cannot queue up future skips/pauses.
 func (play *Player) Pause() error {

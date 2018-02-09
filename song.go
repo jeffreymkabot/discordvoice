@@ -9,10 +9,9 @@ import (
 type SongOption func(*song)
 
 // PreEncoded
-func PreEncoded(r io.Reader) SongOption {
+func PreEncoded() SongOption {
 	return func(s *song) {
 		s.preencoded = true
-		s.reader = r
 	}
 }
 
@@ -30,13 +29,6 @@ func Filter(af string) SongOption {
 func Loudness(f float64) SongOption {
 	return func(s *song) {
 		s.loudness = f
-	}
-}
-
-// Title tells the player the song is named something other than its url.
-func Title(t string) SongOption {
-	return func(s *song) {
-		s.title = t
 	}
 }
 
@@ -90,13 +82,14 @@ func OnResume(f func(elapsed time.Duration)) SongOption {
 	}
 }
 
+type SongOpener func() (io.ReadCloser, error)
+
 type song struct {
 	channelID string
 
-	url string
+	open SongOpener
 
 	preencoded bool
-	reader     io.Reader
 
 	filters  string
 	loudness float64
