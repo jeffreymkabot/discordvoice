@@ -9,7 +9,7 @@ import (
 	"github.com/bwmarrin/discordgo"
 )
 
-type control uint8
+type control byte
 
 const (
 	nop control = iota
@@ -17,8 +17,11 @@ const (
 	pause
 )
 
-// ErrFull is emitted when the Player queue is full
+// ErrFull is emitted when the Player queue is full.
 var ErrFull = errors.New("Full send buffer")
+
+// ErrInvalidVoiceChannel is emitted when a song is queued without a real voice channel.
+var ErrInvalidVoiceChannel = errors.New("Invalid voice channel")
 
 // DefaultConfig is the config that is used when no PlayerOptions are passed to Connect.
 var DefaultConfig = PlayerConfig{
@@ -66,18 +69,19 @@ func IdleTimeout(n int) PlayerOption {
 
 // Player
 type Player struct {
+	discord *discordgo.Session
+	cfg     *PlayerConfig
 	// mutex to prevent concurrent invocations of enqueue from getting around QueueLength
 	mu sync.Mutex
 	// can't use a ringbuffer since it's bugged and uses all the cpu
 	queue *queue.Queue
 	ctrl  chan control
 	quit  chan struct{}
-	cfg   *PlayerConfig
 }
 
 // Connect launches a Player that dispatches voice to a discord guild.
 // Since discord allows only one voice connection per guild, you should call Player.Quit before calling Connect again for the same guild.
-func Connect(s *discordgo.Session, guildID string, idleChannelID string, opts ...PlayerOption) *Player {
+func Connect(discord *discordgo.Session, guildID string, idleChannelID string, opts ...PlayerOption) *Player {
 	cfg := DefaultConfig
 	for _, opt := range opts {
 		opt(&cfg)
@@ -89,22 +93,31 @@ func Connect(s *discordgo.Session, guildID string, idleChannelID string, opts ..
 	quit := make(chan struct{})
 
 	player := &Player{
-		queue: queue,
-		quit:  quit,
-		cfg:   &cfg,
+		discord: discord,
+		cfg:     &cfg,
+		queue:   queue,
+		quit:    quit,
 	}
 
-	go sender(player, s, guildID, idleChannelID)
+	if !validVoiceChannel(discord, idleChannelID) {
+		idleChannelID = ""
+	}
+
+	go sender(player, discord, guildID, idleChannelID)
 
 	return player
 }
 
 // Enqueue puts an item at the end of the queue.
 func (play *Player) Enqueue(channelID string, title string, songOpener SongOpener, opts ...SongOption) error {
+	if !validVoiceChannel(play.discord, channelID) {
+		return ErrInvalidVoiceChannel
+	}
+
 	// lock ensures concurrent calls to Enqueue do not get around QueueLength
 	play.mu.Lock()
+	defer play.mu.Unlock()
 	if play.queue.Len() >= int64(play.cfg.QueueLength) {
-		play.mu.Unlock()
 		return ErrFull
 	}
 
@@ -124,7 +137,6 @@ func (play *Player) Enqueue(channelID string, title string, songOpener SongOpene
 	}
 
 	err := play.queue.Put(s)
-	play.mu.Unlock()
 
 	return err
 }
@@ -134,7 +146,8 @@ func (play *Player) Length() int {
 	return int(play.queue.Len())
 }
 
-// Next returns the title of the next item in the queue.
+// Next returns the title of the next item in the queue, or
+// the empty string if there is there is no item.
 func (play *Player) Next() string {
 	if item, err := play.queue.Peek(); err == nil {
 		if s, ok := item.(*song); ok {
@@ -164,6 +177,7 @@ func (play *Player) Clear() error {
 // i.e. you cannot queue up future skips/pauses.
 func (play *Player) Skip() error {
 	// lock prevents concurrent write to play.ctrl in sendSong
+	// TODO mutex in order to send on a channel is probably an antipattern and should be reconsidered
 	play.mu.Lock()
 	defer play.mu.Unlock()
 	if play.ctrl == nil {
@@ -183,6 +197,7 @@ func (play *Player) Skip() error {
 // i.e. you cannot queue up future skips/pauses.
 func (play *Player) Pause() error {
 	// lock prevents concurrent write to play.ctrl in sendSong
+	// TODO mutex in order to send on a channel is probably an antipattern and should be reconsidered
 	play.mu.Lock()
 	defer play.mu.Unlock()
 	if play.ctrl == nil {
@@ -201,8 +216,8 @@ func (play *Player) Pause() error {
 func (play *Player) Quit() {
 	// lock prevents concurrent call to quit from closing play.quit twice
 	play.mu.Lock()
+	defer play.mu.Unlock()
 	if play.queue.Disposed() {
-		play.mu.Unlock()
 		return
 	}
 
@@ -213,5 +228,12 @@ func (play *Player) Quit() {
 		}
 	}
 	close(play.quit)
-	play.mu.Unlock()
+}
+
+func validVoiceChannel(discord *discordgo.Session, channelID string) bool {
+	channel, err := discord.State.Channel(channelID)
+	if err != nil {
+		channel, err = discord.Channel(channelID)
+	}
+	return err == nil && channel.Type == discordgo.ChannelTypeGuildVoice
 }

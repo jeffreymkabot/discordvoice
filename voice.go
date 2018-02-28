@@ -11,7 +11,7 @@ import (
 	"github.com/pkg/errors"
 )
 
-const Version = "0.3.0"
+const Version = "0.3.1"
 
 var defaultEncodeOptions = dca.EncodeOptions{
 	Volume:           256,
@@ -39,10 +39,12 @@ func sender(player *Player, session *discordgo.Session, guildID string, idleChan
 	// isIdle := pollTimeout == 0
 	pollTimeout := time.Duration(player.cfg.IdleTimeout) * time.Millisecond
 
-	// join interacts with vc in closure
 	// join("") to disconnect
 	join := func(channelID string) error {
-		if channelID == "" && vc != nil {
+		if channelID == "" {
+			if vc == nil {
+				return nil
+			}
 			return vc.Disconnect()
 		}
 
