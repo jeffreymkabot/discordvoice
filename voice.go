@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/Workiva/go-datastructures/queue"
-	"github.com/bwmarrin/discordgo"
 	"github.com/jonas747/dca"
 	"github.com/pkg/errors"
 )
@@ -28,46 +27,23 @@ var defaultEncodeOptions = dca.EncodeOptions{
 	AudioFilter:      "",
 }
 
-func sender(player *Player, session *discordgo.Session, guildID string, idleChannelID string) {
+func sender(player *Player, opener VoiceWriterOpener, idleChannelID string) {
 	if player.queue == nil || player.queue.Disposed() {
 		return
 	}
 
-	var vc *discordgo.VoiceConnection
-	var err error
+	var writer VoiceWriter
+	defer func() {
+		// possibly nil if never joined a channel
+		if writer != nil {
+			writer.Close()
+		}
+	}()
 
 	// isIdle := pollTimeout == 0
 	pollTimeout := time.Duration(player.cfg.IdleTimeout) * time.Millisecond
 
-	// join("") to disconnect
-	join := func(channelID string) error {
-		if channelID == "" {
-			if vc == nil {
-				return nil
-			}
-			return vc.Disconnect()
-		}
-
-		// read vc.ChannelID into a temp variable because ChannelVoiceJoin takes its own write mutex on vc
-		vcChannelID := ""
-		if vc != nil {
-			vc.RLock()
-			vcChannelID = vc.ChannelID
-			vc.RUnlock()
-		}
-
-		// don't attempt to join a channel we are already in
-		if vc == nil || vcChannelID != channelID {
-			vc, err = session.ChannelVoiceJoin(guildID, channelID, false, true)
-			return err
-		}
-
-		return nil
-	}
-
-	defer join("")
-
-	err = join(idleChannelID)
+	_, err := opener.Open(idleChannelID)
 	if err != nil {
 		log.Printf("error join idle channel %v", err)
 	}
@@ -76,7 +52,7 @@ func sender(player *Player, session *discordgo.Session, guildID string, idleChan
 		items, err := player.queue.Poll(1, pollTimeout)
 		if err == queue.ErrTimeout {
 			pollTimeout = 0
-			err = join(idleChannelID)
+			_, err = opener.Open(idleChannelID)
 			if err != nil {
 				log.Printf("error join idle channel %v", err)
 			}
@@ -90,24 +66,26 @@ func sender(player *Player, session *discordgo.Session, guildID string, idleChan
 			continue
 		}
 
-		s, ok := items[0].(*song)
+		song, ok := items[0].(*songItem)
 		if !ok {
 			// should not be possible, but avoid a panic just in case
 			pollTimeout = time.Duration(player.cfg.IdleTimeout) * time.Millisecond
 			continue
 		}
 
-		err = join(s.channelID)
+		writer, err = opener.Open(song.channelID)
 		if err != nil {
-			s.onEnd(0, errors.Wrap(err, "failed to join song channel"))
+			song.onEnd(0, errors.Wrap(err, "failed to join song channel"))
 		} else {
-			s.onEnd(sendSong(player, s, vc))
+			song.onEnd(sendSong(player, song, writer))
 		}
 		pollTimeout = time.Duration(player.cfg.IdleTimeout) * time.Millisecond
 	}
 }
 
-func sendSong(play *Player, s *song, vc *discordgo.VoiceConnection) (time.Duration, error) {
+// TODO I should be able to pass in an io.Reader instead of songItem and an io.Writer instead of VoiceWriter
+// handle opening song etc outside this function
+func sendSong(play *Player, s *songItem, writer VoiceWriter) (time.Duration, error) {
 	opusReader, cleanup, err := opusReader(s)
 	if err != nil {
 		return 0, errors.Wrap(err, "failed to stream url / file")
@@ -123,10 +101,8 @@ func sendSong(play *Player, s *song, vc *discordgo.VoiceConnection) (time.Durati
 		frameTimes = make([]time.Time, frameInterval, frameInterval)
 	}
 
-	sendTimeout := time.Duration(time.Duration(play.cfg.SendTimeout) * time.Millisecond)
-
-	vc.Speaking(true)
-	defer vc.Speaking(false)
+	writer.Speaking(true)
+	defer writer.Speaking(false)
 
 	// lock prevents concurrent read of play.ctrl in Pause() / Skip()
 	play.mu.Lock()
@@ -202,13 +178,12 @@ func sendSong(play *Player, s *song, vc *discordgo.VoiceConnection) (time.Durati
 			s.onProgress(time.Duration(frameCount)*frameSize, cpy)
 		}
 
-		select {
-		case vc.OpusSend <- frame:
-			if frameInterval > 0 {
-				frameTimes[frameCount%frameInterval] = time.Now()
-			}
-		case <-time.After(sendTimeout):
-			return time.Duration(frameCount) * frameSize, errors.Errorf("send timeout on voice connection %#v", vc)
+		_, err = writer.Write(frame)
+		if err != nil {
+			return time.Duration(frameCount) * frameSize, errors.Wrap(err, "failed to write frame")
+		}
+		if frameInterval > 0 {
+			frameTimes[frameCount%frameInterval] = time.Now()
 		}
 
 		frameCount++
@@ -216,7 +191,7 @@ func sendSong(play *Player, s *song, vc *discordgo.VoiceConnection) (time.Durati
 }
 
 // wrap an opusreader around the song source
-func opusReader(s *song) (dca.OpusReader, func(), error) {
+func opusReader(s *songItem) (dca.OpusReader, func(), error) {
 	readCloser, err := s.open()
 	if err != nil {
 		return nil, func() {}, err
