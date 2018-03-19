@@ -5,246 +5,195 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Workiva/go-datastructures/queue"
-	"github.com/bwmarrin/discordgo"
 	"github.com/pkg/errors"
 )
 
-type control byte
+const Version = "0.3.1"
 
-const (
-	nop control = iota
-	skip
-	pause
+// Player errors
+var (
+	ErrFull                = errors.New("queue is full")
+	ErrClosed              = errors.New("player is closed")
+	ErrInvalidVoiceChannel = errors.New("invalid voice channel")
 )
 
-// ErrFull is emitted when the Player queue is full.
-var ErrFull = errors.New("Full send buffer")
-
-// ErrInvalidVoiceChannel is emitted when a song is queued without a real voice channel.
-var ErrInvalidVoiceChannel = errors.New("Invalid voice channel")
-
-// DefaultConfig is the config that is used when no PlayerOptions are passed to Connect.
-var DefaultConfig = PlayerConfig{
-	QueueLength: 100,
-	SendTimeout: 1000,
-	IdleTimeout: 300,
-}
-
-// PlayerConfig sets some behaviors of the Player.
-type PlayerConfig struct {
-	QueueLength int `toml:"queue_length"`
-	SendTimeout int `toml:"send_timeout"`
-	IdleTimeout int `toml:"afk_timeout"`
-}
-
-// PlayerOption
-type PlayerOption func(*PlayerConfig)
-
-// QueueLength is the maximum number of Payloads that will be allowed in the queue.
-func QueueLength(n int) PlayerOption {
-	return func(cfg *PlayerConfig) {
-		if n > 0 {
-			cfg.QueueLength = n
-		}
-	}
-}
-
-// SendTimeout is number of milliseconds the player will wait to attempt to send an audio frame before moving onto the next song.
-func SendTimeout(n int) PlayerOption {
-	return func(cfg *PlayerConfig) {
-		if n > 0 {
-			cfg.SendTimeout = n
-		}
-	}
-}
-
-// IdleTimeout is the number of milliseconds the player will wait for another Payload before joining the idle channel.
-func IdleTimeout(n int) PlayerOption {
-	return func(cfg *PlayerConfig) {
-		if n > 0 {
-			cfg.IdleTimeout = n
-		}
-	}
-}
-
-// VoiceWriterOpener
-type VoiceWriterOpener interface {
-	Open(channelID string) (VoiceWriter, error)
-}
-
-type VoiceWriter interface {
-	io.WriteCloser
-	Speaking(bool) error
-}
-
-// DiscordWriterOpener is a synchronous implementation of the VoiceWriterOpener interface.
-// TODO this impl could be a subpackage, really
-type DiscordWriterOpener struct {
-	guildID     string
-	sendTimeout time.Duration
-	discord     *discordgo.Session
-	mu          sync.Mutex
-	writer      *discordVoiceWriter
-}
-
-func NewDiscordWriterOpener(discord *discordgo.Session, guildID string, sendTimeout time.Duration) *DiscordWriterOpener {
-	return &DiscordWriterOpener{
-		guildID:     guildID,
-		sendTimeout: sendTimeout,
-		discord:     discord,
-	}
-}
-
-// Open
-// Open will recycle the previous WriteCloser if it is still open to the same channelID.
-func (dwo *DiscordWriterOpener) Open(channelID string) (VoiceWriter, error) {
-	if !validVoiceChannel(dwo.discord, channelID) {
-		return nil, ErrInvalidVoiceChannel
-	}
-	dwo.mu.Lock()
-	defer dwo.mu.Unlock()
-	if dwo.writer == nil || dwo.writer.channelID != channelID || !dwo.writer.ready() {
-		vconn, err := dwo.discord.ChannelVoiceJoin(dwo.guildID, channelID, false, true)
-		if err != nil {
-			dwo.writer = nil
-			return nil, errors.Wrap(err, "failed to join discord channel")
-		}
-		dwo.writer = &discordVoiceWriter{channelID, dwo.sendTimeout, vconn}
-	}
-	return dwo.writer, nil
-}
-
-// discordVoiceWriter implements io.WriteCloser
-type discordVoiceWriter struct {
-	channelID   string
-	sendTimeout time.Duration
-	vconn       *discordgo.VoiceConnection
-}
-
-func (dvw *discordVoiceWriter) ready() bool {
-	dvw.vconn.RLock()
-	defer dvw.vconn.RUnlock()
-	// check that the channel hasn't changed under our nose
-	// e.g. a user dragging us into a different channel?
-	return dvw.vconn.ChannelID == dvw.channelID && dvw.vconn.Ready
-}
-
-func (dvw *discordVoiceWriter) Write(p []byte) (n int, err error) {
-	if !dvw.ready() {
-		err = errors.New("voice connection closed")
-		return
-	}
-	select {
-	case dvw.vconn.OpusSend <- p:
-		n = len(p)
-		return
-	case <-time.After(dvw.sendTimeout):
-		err = errors.Errorf("send timeout on voice connection after %vms", dvw.sendTimeout)
-		return
-	}
-}
-
-func (dvw *discordVoiceWriter) Close() error {
-	return dvw.vconn.Disconnect()
-}
-
-func (dvw *discordVoiceWriter) Speaking(b bool) error {
-	return dvw.vconn.Speaking(b)
-}
+var errPollTimeout = errors.New("poll timeout")
 
 // Player
 type Player struct {
-	cfg *PlayerConfig
-	// mutex to prevent concurrent invocations of enqueue from getting around QueueLength
-	mu sync.Mutex
-	// can't use a ringbuffer since it's bugged and uses all the cpu
-	queue *queue.Queue
-	ctrl  chan control
-	quit  chan struct{}
+	cfg  *PlayerConfig
+	quit chan struct{}
+	wg   sync.WaitGroup
+
+	mu      sync.RWMutex
+	queue   []*songItem
+	waiters []waiter
+	ctrl    chan control
 }
 
-// Connect launches a Player that dispatches voice to a discord guild.
-// Since discord allows only one voice connection per guild, you should call Player.Quit before calling Connect again for the same guild.
-func Connect(opener VoiceWriterOpener, idleChannelID string, opts ...PlayerOption) *Player {
+type songItem struct {
+	channelID string
+	open      SongOpenFunc
+	title     string
+
+	preencoded bool
+	loudness   float64
+	filters    string
+	callbacks
+}
+
+type callbacks struct {
+	duration         time.Duration
+	onStart          func()
+	onPause          func(elapsed time.Duration)
+	onResume         func(elapsed time.Duration)
+	progressInterval time.Duration
+	onProgress       func(elapsed time.Duration, frameTimes []time.Time)
+	onEnd            func(elapsed time.Duration, err error)
+}
+
+type waiter struct {
+	dead  chan struct{}
+	input chan *songItem
+}
+
+func New(opener Opener, idle func(), opts ...PlayerOption) *Player {
 	cfg := DefaultConfig
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	// cfg no longer changes after applying options
-	// don't need to use mutex to safely access its properties
-
-	queue := queue.New(int64(cfg.QueueLength))
-	quit := make(chan struct{})
 
 	player := &Player{
-		cfg:   &cfg,
-		queue: queue,
-		quit:  quit,
+		cfg:  &cfg,
+		quit: make(chan struct{}),
+		// buffered so Skip()/Pause() do not wait if busy
+		ctrl: make(chan control, 1),
 	}
 
-	go sender(player, opener, idleChannelID)
+	idle()
+	go playback(player, opener, idle)
 
 	return player
 }
 
+type SongOpenFunc func() (io.ReadCloser, error)
+
 // Enqueue puts an item at the end of the queue.
-func (play *Player) Enqueue(channelID string, title string, songOpener SongOpener, opts ...SongOption) error {
-	// lock ensures concurrent calls to Enqueue do not get around QueueLength
-	play.mu.Lock()
-	defer play.mu.Unlock()
-	if play.queue.Len() >= int64(play.cfg.QueueLength) {
+func (p *Player) Enqueue(channelID string, title string, open SongOpenFunc, opts ...SongOption) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	select {
+	case <-p.quit:
+		return ErrClosed
+	default:
+	}
+
+	if p.cfg.QueueLength > 0 && len(p.queue) >= p.cfg.QueueLength {
 		return ErrFull
 	}
 
-	s := &songItem{
-		channelID:  channelID,
-		open:       songOpener,
-		title:      title,
-		onStart:    func() {},
-		onEnd:      func(time.Duration, error) {},
-		onProgress: func(time.Duration, []time.Time) {},
-		onPause:    func(time.Duration) {},
-		onResume:   func(time.Duration) {},
+	song := &songItem{
+		channelID: channelID,
+		open:      open,
+		title:     title,
+		callbacks: callbacks{
+			onStart:    func() {},
+			onEnd:      func(time.Duration, error) {},
+			onProgress: func(time.Duration, []time.Time) {},
+			onPause:    func(time.Duration) {},
+			onResume:   func(time.Duration) {},
+		},
 	}
 
 	for _, opt := range opts {
-		opt(s)
+		opt(song)
 	}
 
-	err := play.queue.Put(s)
-
-	return err
-}
-
-// Length returns the number of items in the queue.
-func (play *Player) Length() int {
-	return int(play.queue.Len())
-}
-
-// Next returns the title of the next item in the queue, or
-// the empty string if there is there is no item.
-func (play *Player) Next() string {
-	if item, err := play.queue.Peek(); err == nil {
-		if s, ok := item.(*songItem); ok {
-			return s.title
+	// bypass queue and submit song straight to the first poller still waiting for a song
+	for len(p.waiters) > 0 {
+		waiter := p.waiters[0]
+		p.waiters = p.waiters[1:]
+		select {
+		case <-p.quit:
+			return ErrClosed
+		case waiter.input <- song:
+			return nil
+		case <-waiter.dead:
+			// waiter stopped waiting, try the next one
 		}
 	}
-	return ""
+
+	p.queue = append(p.queue, song)
+	return nil
 }
 
-// Clear removes all items from the queue.
-// Clear does not skip the current song.
-func (play *Player) Clear() error {
-	// doesn't need to use player lock because queue has its own internal lock
-	// i.e. play.queue.Put will block until this is done
-	items, err := play.queue.TakeUntil(func(i interface{}) bool { return true })
-	for _, item := range items {
-		if s, ok := item.(*songItem); ok {
-			s.onEnd(0, errors.New("cleared"))
-		}
+// poll blocks until an item is queued, player is closed, or timeout has passed if timeout > 0
+func (p *Player) poll(timeout time.Duration) (*songItem, error) {
+	p.mu.Lock()
+	select {
+	case <-p.quit:
+		p.mu.Unlock()
+		return nil, ErrClosed
+	default:
 	}
-	return err
+
+	var deadline <-chan time.Time
+	if timeout > 0 {
+		deadline = time.NewTimer(timeout).C
+	}
+
+	if len(p.queue) > 0 {
+		song := p.queue[0]
+		p.queue = p.queue[1:]
+		p.mu.Unlock()
+		return song, nil
+	}
+
+	// add me to the list of waiters and wait for a song
+	// buffered so enqueue does not wait for me
+	me := waiter{
+		input: make(chan *songItem, 1),
+		dead:  make(chan struct{}),
+	}
+	p.waiters = append(p.waiters, me)
+	p.mu.Unlock()
+
+	select {
+	case <-p.quit:
+		return nil, ErrClosed
+	case <-deadline:
+		// make sure enqueue does not consider me eligible anymore
+		close(me.dead)
+		return nil, errPollTimeout
+	case song := <-me.input:
+		return song, nil
+	}
+}
+
+// List returns the names of items in the queue.
+func (p *Player) List() []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	titles := make([]string, len(p.queue))
+	for i, song := range p.queue {
+		titles[i] = song.title
+	}
+	return titles
+}
+
+// Clear removes all queued items.
+// Clear does not skip the currently playing item.
+func (p *Player) Clear() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.clear("cleared")
+}
+
+func (play *Player) clear(reason string) {
+	for _, s := range play.queue {
+		s.onEnd(0, errors.New(reason))
+	}
+	play.queue = nil
 }
 
 // Skip moves to the next item in the queue when an item is playing or is paused.
@@ -252,13 +201,6 @@ func (play *Player) Clear() error {
 // or if the player is already processing a skip or a pause for the current item.
 // i.e. you cannot queue up future skips/pauses.
 func (play *Player) Skip() error {
-	// lock prevents concurrent write to play.ctrl in sendSong
-	// TODO mutex in order to send on a channel is probably an antipattern and should be reconsidered
-	play.mu.Lock()
-	defer play.mu.Unlock()
-	if play.ctrl == nil {
-		return errors.New("nothing to skip")
-	}
 	select {
 	case play.ctrl <- skip:
 	default:
@@ -272,13 +214,6 @@ func (play *Player) Skip() error {
 // or if the player is already processing a skip or a pause for the current item.
 // i.e. you cannot queue up future skips/pauses.
 func (play *Player) Pause() error {
-	// lock prevents concurrent write to play.ctrl in sendSong
-	// TODO mutex in order to send on a channel is probably an antipattern and should be reconsidered
-	play.mu.Lock()
-	defer play.mu.Unlock()
-	if play.ctrl == nil {
-		return errors.New("nothing to pause")
-	}
 	select {
 	case play.ctrl <- pause:
 	default:
@@ -287,29 +222,30 @@ func (play *Player) Pause() error {
 	return nil
 }
 
-// Quit closes the player.
-// You should call quit before calling connect again for the same guild.
-func (play *Player) Quit() {
-	// lock prevents concurrent call to quit from closing play.quit twice
+// Close releases the resources for the player and all queued items.
+// Close will block until all onEnd callbacks have returned.
+// You should call Close before opening another Player targetting the same resources.
+func (play *Player) Close() error {
 	play.mu.Lock()
 	defer play.mu.Unlock()
-	if play.queue.Disposed() {
-		return
+	select {
+	case <-play.quit:
+		return ErrClosed
+	default:
 	}
 
-	items := play.queue.Dispose()
-	for _, item := range items {
-		if s, ok := item.(*songItem); ok {
-			s.onEnd(0, errors.New("quit"))
-		}
-	}
 	close(play.quit)
+	// clear calls onEnd callbacks of queued songs
+	play.clear("quit")
+	// wait for onEnd callback of currently playing song
+	play.wg.Wait()
+	return nil
 }
 
-func validVoiceChannel(discord *discordgo.Session, channelID string) bool {
-	channel, err := discord.State.Channel(channelID)
-	if err != nil {
-		channel, err = discord.Channel(channelID)
-	}
-	return err == nil && channel.Type == discordgo.ChannelTypeGuildVoice
-}
+type control byte
+
+const (
+	nop control = iota
+	skip
+	pause
+)

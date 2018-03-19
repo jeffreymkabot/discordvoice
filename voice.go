@@ -2,15 +2,157 @@ package discordvoice
 
 import (
 	"fmt"
-	"log"
+	"io"
 	"time"
 
-	"github.com/Workiva/go-datastructures/queue"
 	"github.com/jonas747/dca"
 	"github.com/pkg/errors"
 )
 
-const Version = "0.3.1"
+func playback(player *Player, opener Opener, idle func()) {
+	// isIdle := pollTimeout == 0
+	pollTimeout := time.Duration(player.cfg.IdleTimeout) * time.Millisecond
+
+	for {
+		song, err := player.poll(pollTimeout)
+		if err == errPollTimeout {
+			pollTimeout = 0
+			idle()
+			continue
+		} else if err != nil {
+			return
+		}
+		pollTimeout = time.Duration(player.cfg.IdleTimeout) * time.Millisecond
+
+		player.wg.Add(1)
+		elapsed, err := openAndPlay(player, song, opener)
+		song.onEnd(elapsed, err)
+		player.wg.Done()
+	}
+}
+
+func openAndPlay(player *Player, song *songItem, opener Opener) (elapsed time.Duration, err error) {
+	var reader dca.OpusReader
+	var writer Writer
+
+	writer, err = opener.Open(song.channelID)
+	if err != nil {
+		err = errors.Wrap(err, "failed to join song channel")
+		return
+	}
+
+	rc, err := song.open()
+	if err != nil {
+		err = errors.Wrap(err, "failed to open song")
+		return
+	}
+	defer rc.Close()
+
+	if song.preencoded {
+		reader = dca.NewDecoder(rc)
+	} else {
+		opts := defaultEncodeOptions
+		opts.AudioFilter = song.filters
+		if song.loudness != 0 {
+			if opts.AudioFilter != "" {
+				opts.AudioFilter += ", "
+			}
+			opts.AudioFilter += fmt.Sprintf("loudnorm=i=%.1f", song.loudness)
+		}
+
+		var enc *dca.EncodeSession
+		enc, err = dca.EncodeMem(rc, &opts)
+		if err != nil {
+			err = errors.Wrap(err, "failed to start encoder")
+			return
+		}
+		defer enc.Cleanup()
+		reader = enc
+	}
+
+	writer.Speaking(true)
+	elapsed, err = play(player, reader, writer, song.callbacks)
+	writer.Speaking(false)
+	return
+}
+
+func play(player *Player, src dca.OpusReader, dst io.Writer, cb callbacks) (elapsed time.Duration, err error) {
+	sig := make(chan struct{})
+	close(sig)
+	// playing if ready == sig, paused if ready == nil
+	ready := sig
+
+	var frame []byte
+	nWrites, frameDur := 0, src.FrameDuration()
+
+	var writeInterval int
+	var writeTimes []time.Time
+	if cb.progressInterval > 0 {
+		writeInterval = int(cb.progressInterval / frameDur)
+		writeTimes = make([]time.Time, writeInterval, writeInterval)
+	}
+
+	// drain any buffered control signals (e.g. client called Skip() before any song was queued)
+	for {
+		select {
+		case <-player.ctrl:
+		default:
+		}
+	}
+
+	cb.onStart()
+	for {
+		select {
+		case <-player.quit:
+			err = errors.New("quit")
+			return
+		case c := <-player.ctrl:
+			switch c {
+			case skip:
+				err = errors.New("skipped")
+				return
+			case pause:
+				if ready != nil {
+					cb.onPause(elapsed)
+					ready = nil
+				} else {
+					cb.onResume(elapsed)
+					ready = sig
+				}
+			}
+		case <-ready:
+			frame, err = src.OpusFrame()
+			if err != nil {
+				err = errors.Wrap(err, "failed to read frame")
+				// include some extra debug info if failed well before we should have
+				if cb.duration > 0 && cb.duration-elapsed > 1*time.Second {
+					if enc, ok := src.(*dca.EncodeSession); ok {
+						err = errors.WithMessage(err, enc.FFMPEGMessages())
+					}
+				}
+				return
+			}
+			_, err = dst.Write(frame)
+			if err != nil {
+				err = errors.Wrap(err, "failed to write frame")
+				return
+			}
+
+			nWrites++
+			elapsed = time.Duration(nWrites) * frameDur
+
+			// only invoke onProgress callback if given a valid progressInterval
+			if writeInterval > 0 {
+				writeTimes[(nWrites-1)%writeInterval] = time.Now()
+				if nWrites > 0 && nWrites%writeInterval == 0 {
+					var tmp []time.Time
+					copy(tmp, writeTimes)
+					cb.onProgress(elapsed, tmp)
+				}
+			}
+		}
+	}
+}
 
 var defaultEncodeOptions = dca.EncodeOptions{
 	Volume:           256,
@@ -25,195 +167,4 @@ var defaultEncodeOptions = dca.EncodeOptions{
 	BufferedFrames:   100,
 	VBR:              false,
 	AudioFilter:      "",
-}
-
-func sender(player *Player, opener VoiceWriterOpener, idleChannelID string) {
-	if player.queue == nil || player.queue.Disposed() {
-		return
-	}
-
-	var writer VoiceWriter
-	defer func() {
-		// possibly nil if never joined a channel
-		if writer != nil {
-			writer.Close()
-		}
-	}()
-
-	// isIdle := pollTimeout == 0
-	pollTimeout := time.Duration(player.cfg.IdleTimeout) * time.Millisecond
-
-	_, err := opener.Open(idleChannelID)
-	if err != nil {
-		log.Printf("error join idle channel %v", err)
-	}
-
-	for {
-		items, err := player.queue.Poll(1, pollTimeout)
-		if err == queue.ErrTimeout {
-			pollTimeout = 0
-			_, err = opener.Open(idleChannelID)
-			if err != nil {
-				log.Printf("error join idle channel %v", err)
-			}
-			continue
-		} else if err != nil {
-			// disposed, play.Quit() was called
-			return
-		} else if len(items) != 1 {
-			// should not be possible, but avoid a panic just in case
-			pollTimeout = time.Duration(player.cfg.IdleTimeout) * time.Millisecond
-			continue
-		}
-
-		song, ok := items[0].(*songItem)
-		if !ok {
-			// should not be possible, but avoid a panic just in case
-			pollTimeout = time.Duration(player.cfg.IdleTimeout) * time.Millisecond
-			continue
-		}
-
-		writer, err = opener.Open(song.channelID)
-		if err != nil {
-			song.onEnd(0, errors.Wrap(err, "failed to join song channel"))
-		} else {
-			song.onEnd(sendSong(player, song, writer))
-		}
-		pollTimeout = time.Duration(player.cfg.IdleTimeout) * time.Millisecond
-	}
-}
-
-// TODO I should be able to pass in an io.Reader instead of songItem and an io.Writer instead of VoiceWriter
-// handle opening song etc outside this function
-func sendSong(play *Player, s *songItem, writer VoiceWriter) (time.Duration, error) {
-	opusReader, cleanup, err := opusReader(s)
-	if err != nil {
-		return 0, errors.Wrap(err, "failed to stream url / file")
-	}
-	defer cleanup()
-
-	frameCount := 0
-	frameSize := opusReader.FrameDuration()
-	frameInterval := 0
-	var frameTimes []time.Time
-	if s.progressInterval > 0 {
-		frameInterval = int(s.progressInterval / frameSize)
-		frameTimes = make([]time.Time, frameInterval, frameInterval)
-	}
-
-	writer.Speaking(true)
-	defer writer.Speaking(false)
-
-	// lock prevents concurrent read of play.ctrl in Pause() / Skip()
-	play.mu.Lock()
-	play.ctrl = make(chan control, 1)
-	play.mu.Unlock()
-	defer func() {
-		play.mu.Lock()
-		play.ctrl = nil
-		play.mu.Unlock()
-	}()
-
-	paused := false
-	s.onStart()
-
-	for {
-		select {
-		case <-play.quit:
-			return time.Duration(frameCount) * frameSize, errors.New("quit")
-		case c := <-play.ctrl:
-			switch c {
-			case skip:
-				return time.Duration(frameCount) * frameSize, errors.New("skipped")
-			case pause:
-				paused = !paused
-			}
-		default:
-		}
-
-		// TODO is it possible to impl pause without repeating code
-		if paused {
-			s.onPause(time.Duration(frameCount) * frameSize)
-
-			select {
-			case <-play.quit:
-				return time.Duration(frameCount) * frameSize, errors.New("quit")
-			case c := <-play.ctrl:
-				switch c {
-				case skip:
-					return time.Duration(frameCount) * frameSize, errors.New("skipped")
-				case pause:
-					paused = !paused
-					s.onResume(time.Duration(frameCount) * frameSize)
-				}
-			}
-		}
-
-		// underlying impl is encoding/binary.Read
-		// err is EOF iff no bytes were read
-		// err is UnexpectedEOF if partial frame is read
-		frame, err := opusReader.OpusFrame()
-		if err != nil {
-			// see if this was significantly before the expected end of the song
-			deviation := s.duration - time.Duration(frameCount)*frameSize
-			if deviation < 0 {
-				deviation *= -1
-			}
-			if s.duration > 0 && deviation > 300*time.Millisecond {
-				if enc, ok := opusReader.(*dca.EncodeSession); ok {
-					err = errors.WithMessage(err, enc.FFMPEGMessages())
-				}
-			}
-			return time.Duration(frameCount) * frameSize, errors.Wrap(err, "failed to read frame")
-		}
-
-		// send a status every n frames
-		if frameInterval > 0 && frameCount > 0 && frameCount%frameInterval == 0 {
-			// careful frameTimes is pointer to array and if onProgress is async frameTimes will change while onProgress uses it
-			// TODO why are the first three frameTimes in every frameInterval sometimes equal
-			// vc.OpusSend is buffered to length=2 but its read-interval is 20ms
-			// so I don't think copying here could delay three reads that the buffer clears
-			cpy := make([]time.Time, len(frameTimes))
-			copy(cpy, frameTimes)
-			s.onProgress(time.Duration(frameCount)*frameSize, cpy)
-		}
-
-		_, err = writer.Write(frame)
-		if err != nil {
-			return time.Duration(frameCount) * frameSize, errors.Wrap(err, "failed to write frame")
-		}
-		if frameInterval > 0 {
-			frameTimes[frameCount%frameInterval] = time.Now()
-		}
-
-		frameCount++
-	}
-}
-
-// wrap an opusreader around the song source
-func opusReader(s *songItem) (dca.OpusReader, func(), error) {
-	readCloser, err := s.open()
-	if err != nil {
-		return nil, func() {}, err
-	}
-
-	if s.preencoded {
-		return dca.NewDecoder(readCloser), func() { readCloser.Close() }, nil
-	}
-
-	opts := defaultEncodeOptions
-	opts.AudioFilter = s.filters
-	if s.loudness != 0 {
-		if opts.AudioFilter != "" {
-			opts.AudioFilter += ", "
-		}
-		opts.AudioFilter += fmt.Sprintf("loudnorm=i=%.1f", s.loudness)
-	}
-
-	encoder, err := dca.EncodeMem(readCloser, &opts)
-	if err != nil {
-		readCloser.Close()
-		return nil, func() {}, err
-	}
-	return encoder, func() { readCloser.Close(); encoder.Cleanup() }, err
 }
