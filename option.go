@@ -1,4 +1,4 @@
-package discordvoice
+package player
 
 import "time"
 

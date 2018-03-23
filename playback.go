@@ -1,4 +1,4 @@
-package discordvoice
+package player
 
 import (
 	"fmt"
@@ -9,7 +9,7 @@ import (
 	"github.com/pkg/errors"
 )
 
-func playback(player *Player, opener Opener, idle func()) {
+func playback(player *Player, opener WriterOpener, idle func()) {
 	// isIdle := pollTimeout == 0
 	pollTimeout := time.Duration(player.cfg.IdleTimeout) * time.Millisecond
 
@@ -31,9 +31,9 @@ func playback(player *Player, opener Opener, idle func()) {
 	}
 }
 
-func openAndPlay(player *Player, song *songItem, opener Opener) (elapsed time.Duration, err error) {
+func openAndPlay(player *Player, song *songItem, opener WriterOpener) (elapsed time.Duration, err error) {
 	var reader dca.OpusReader
-	var writer Writer
+	var writer io.WriteCloser
 
 	writer, err = opener.Open(song.channelID)
 	if err != nil {
@@ -70,9 +70,7 @@ func openAndPlay(player *Player, song *songItem, opener Opener) (elapsed time.Du
 		reader = enc
 	}
 
-	writer.Speaking(true)
 	elapsed, err = play(player, reader, writer, song.callbacks)
-	writer.Speaking(false)
 	return
 }
 
@@ -93,12 +91,7 @@ func play(player *Player, src dca.OpusReader, dst io.Writer, cb callbacks) (elap
 	}
 
 	// drain any buffered control signals (e.g. client called Skip() before any song was queued)
-	for {
-		select {
-		case <-player.ctrl:
-		default:
-		}
-	}
+	drain(player.ctrl)
 
 	cb.onStart()
 	for {
@@ -150,6 +143,16 @@ func play(player *Player, src dca.OpusReader, dst io.Writer, cb callbacks) (elap
 					cb.onProgress(elapsed, tmp)
 				}
 			}
+		}
+	}
+}
+
+func drain(ctrl <-chan control) {
+	for {
+		select {
+		case <-ctrl:
+		default:
+			return
 		}
 	}
 }

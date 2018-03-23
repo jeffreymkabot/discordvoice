@@ -1,4 +1,4 @@
-package discordvoice
+package player
 
 import (
 	"io"
@@ -12,9 +12,8 @@ const Version = "0.3.1"
 
 // Player errors
 var (
-	ErrFull                = errors.New("queue is full")
-	ErrClosed              = errors.New("player is closed")
-	ErrInvalidVoiceChannel = errors.New("invalid voice channel")
+	ErrFull   = errors.New("queue is full")
+	ErrClosed = errors.New("player is closed")
 )
 
 var errPollTimeout = errors.New("poll timeout")
@@ -57,7 +56,11 @@ type waiter struct {
 	input chan *songItem
 }
 
-func New(opener Opener, idle func(), opts ...PlayerOption) *Player {
+type WriterOpener interface {
+	Open(channelID string) (io.WriteCloser, error)
+}
+
+func New(opener WriterOpener, idle func(), opts ...PlayerOption) *Player {
 	cfg := DefaultConfig
 	for _, opt := range opts {
 		opt(&cfg)

@@ -1,7 +1,6 @@
 package discordvoice
 
 import (
-	"io"
 	"sync"
 	"time"
 
@@ -9,28 +8,19 @@ import (
 	"github.com/pkg/errors"
 )
 
-// Opener
-type Opener interface {
-	Open(channelID string) (Writer, error)
-}
+var ErrInvalidVoiceChannel = errors.New("invalid voice channel")
 
-type Writer interface {
-	io.WriteCloser
-	Speaking(bool) error
-}
-
-// DiscordOpener is a synchronous implementation of the Opener interface.
-// TODO this impl could be a subpackage, really
-type DiscordOpener struct {
+// WriterOpener
+type WriterOpener struct {
 	guildID     string
 	sendTimeout time.Duration
 	discord     *discordgo.Session
 	mu          sync.Mutex
-	writer      *discordWriter
+	writer      *Writer
 }
 
-func NewDiscordOpener(discord *discordgo.Session, guildID string, sendTimeout time.Duration) *DiscordOpener {
-	return &DiscordOpener{
+func NewWriterOpener(discord *discordgo.Session, guildID string, sendTimeout time.Duration) *WriterOpener {
+	return &WriterOpener{
 		guildID:     guildID,
 		sendTimeout: sendTimeout,
 		discord:     discord,
@@ -39,7 +29,7 @@ func NewDiscordOpener(discord *discordgo.Session, guildID string, sendTimeout ti
 
 // Open
 // Open will recycle the previous Writer if it is still open to the same channel.
-func (o *DiscordOpener) Open(channelID string) (Writer, error) {
+func (o *WriterOpener) Open(channelID string) (*Writer, error) {
 	if !validVoiceChannel(o.discord, channelID) {
 		return nil, ErrInvalidVoiceChannel
 	}
@@ -51,19 +41,19 @@ func (o *DiscordOpener) Open(channelID string) (Writer, error) {
 			o.writer = nil
 			return nil, errors.Wrap(err, "failed to join discord channel")
 		}
-		o.writer = &discordWriter{channelID, o.sendTimeout, vconn}
+		o.writer = &Writer{channelID, o.sendTimeout, vconn}
 	}
 	return o.writer, nil
 }
 
-// discordWriter implements Writer.
-type discordWriter struct {
+// Writer
+type Writer struct {
 	channelID   string
 	sendTimeout time.Duration
 	vconn       *discordgo.VoiceConnection
 }
 
-func (w *discordWriter) ready() bool {
+func (w *Writer) ready() bool {
 	w.vconn.RLock()
 	defer w.vconn.RUnlock()
 	// check that the channel hasn't changed under our nose
@@ -71,7 +61,8 @@ func (w *discordWriter) ready() bool {
 	return w.vconn.ChannelID == w.channelID && w.vconn.Ready
 }
 
-func (w *discordWriter) Write(p []byte) (n int, err error) {
+// TODO writer intelligently calls vconn.Speaking(true/false) before/after writing
+func (w *Writer) Write(p []byte) (n int, err error) {
 	if !w.ready() {
 		err = errors.New("voice connection closed")
 		return
@@ -86,12 +77,8 @@ func (w *discordWriter) Write(p []byte) (n int, err error) {
 	}
 }
 
-func (w *discordWriter) Close() error {
+func (w *Writer) Close() error {
 	return w.vconn.Disconnect()
-}
-
-func (w *discordWriter) Speaking(b bool) error {
-	return w.vconn.Speaking(b)
 }
 
 func validVoiceChannel(discord *discordgo.Session, channelID string) bool {
