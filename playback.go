@@ -9,7 +9,7 @@ import (
 	"github.com/pkg/errors"
 )
 
-func playback(player *Player, opener WriterOpener, idle func()) {
+func playback(player *Player, opener WriterOpener) {
 	// isIdle := pollTimeout == 0
 	pollTimeout := time.Duration(player.cfg.IdleTimeout) * time.Millisecond
 
@@ -17,7 +17,7 @@ func playback(player *Player, opener WriterOpener, idle func()) {
 		song, err := player.poll(pollTimeout)
 		if err == errPollTimeout {
 			pollTimeout = 0
-			idle()
+			player.cfg.Idle()
 			continue
 		} else if err != nil {
 			return

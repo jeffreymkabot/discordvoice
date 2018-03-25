@@ -60,8 +60,8 @@ type WriterOpener interface {
 	Open(channelID string) (io.WriteCloser, error)
 }
 
-func New(opener WriterOpener, idle func(), opts ...PlayerOption) *Player {
-	cfg := DefaultConfig
+func New(opener WriterOpener, opts ...PlayerOption) *Player {
+	cfg := PlayerConfig{Idle: func() {}}
 	for _, opt := range opts {
 		opt(&cfg)
 	}
@@ -73,8 +73,8 @@ func New(opener WriterOpener, idle func(), opts ...PlayerOption) *Player {
 		ctrl: make(chan control, 1),
 	}
 
-	idle()
-	go playback(player, opener, idle)
+	player.cfg.Idle()
+	go playback(player, opener)
 
 	return player
 }
@@ -173,8 +173,8 @@ func (p *Player) poll(timeout time.Duration) (*songItem, error) {
 	}
 }
 
-// List returns the names of items in the queue.
-func (p *Player) List() []string {
+// Playlist returns the titles of items in the queue.
+func (p *Player) Playlist() []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	titles := make([]string, len(p.queue))
@@ -199,34 +199,26 @@ func (play *Player) clear(reason string) {
 	play.queue = nil
 }
 
-// Skip moves to the next item in the queue when an item is playing or is paused.
-// Skip has no effect if no item is playing or is paused
-// or if the player is already processing a skip or a pause for the current item.
-// i.e. you cannot queue up future skips/pauses.
-func (play *Player) Skip() error {
+// Skip the currently playing or paused item.
+func (play *Player) Skip() {
+	// ctrl channel is buffered to 1
 	select {
 	case play.ctrl <- skip:
 	default:
-		return errors.New("busy")
 	}
-	return nil
 }
 
-// Pause stops the currently playing item or resumes the currently paused item.
-// Pause has no effect if no item is playing or is paused
-// or if the player is already processing a skip or a pause for the current item.
-// i.e. you cannot queue up future skips/pauses.
-func (play *Player) Pause() error {
+// Pause the currently playing item or resume the currently paused item.
+func (play *Player) Pause() {
+	// ctrl channel is buffered to 1
 	select {
 	case play.ctrl <- pause:
 	default:
-		return errors.New("busy")
 	}
-	return nil
 }
 
 // Close releases the resources for the player and all queued items.
-// Close will block until all onEnd callbacks have returned.
+// Close will block until all OnEnd callbacks have returned.
 // You should call Close before opening another Player targetting the same resources.
 func (play *Player) Close() error {
 	play.mu.Lock()
@@ -245,6 +237,7 @@ func (play *Player) Close() error {
 	return nil
 }
 
+// send signals to the currently playing item
 type control byte
 
 const (
