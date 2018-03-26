@@ -8,7 +8,7 @@ import (
 	"github.com/pkg/errors"
 )
 
-const Version = "0.3.1"
+const Version = "0.4.0"
 
 // Player errors
 var (
@@ -18,7 +18,7 @@ var (
 
 var (
 	errPollTimeout = errors.New("poll timeout")
-	errCleared = errors.New("cleared")
+	errCleared     = errors.New("cleared")
 )
 
 // Player
