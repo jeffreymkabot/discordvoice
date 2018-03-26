@@ -141,7 +141,7 @@ func play(player *Player, src dca.OpusReader, dst io.Writer, cb callbacks) (elap
 			if writeInterval > 0 {
 				writeTimes[(nWrites-1)%writeInterval] = time.Now()
 				if nWrites > 0 && nWrites%writeInterval == 0 {
-					var tmp []time.Time
+					tmp := make([]time.Time, len(writeTimes), len(writeTimes))
 					copy(tmp, writeTimes)
 					cb.onProgress(elapsed, tmp)
 				}

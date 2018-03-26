@@ -16,7 +16,10 @@ var (
 	ErrClosed = errors.New("player is closed")
 )
 
-var errPollTimeout = errors.New("poll timeout")
+var (
+	errPollTimeout = errors.New("poll timeout")
+	errCleared = errors.New("cleared")
+)
 
 // Player
 type Player struct {
@@ -189,12 +192,12 @@ func (p *Player) Playlist() []string {
 func (p *Player) Clear() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.clear("cleared")
+	p.clear(errCleared)
 }
 
-func (play *Player) clear(reason string) {
+func (play *Player) clear(reason error) {
 	for _, s := range play.queue {
-		s.onEnd(0, errors.New(reason))
+		s.onEnd(0, reason)
 	}
 	play.queue = nil
 }
@@ -231,7 +234,7 @@ func (play *Player) Close() error {
 
 	close(play.quit)
 	// clear calls onEnd callbacks of queued songs
-	play.clear("quit")
+	play.clear(ErrClosed)
 	// wait for onEnd callback of currently playing song
 	play.wg.Wait()
 	return nil

@@ -1,6 +1,7 @@
 package discordvoice
 
 import (
+	"io"
 	"sync"
 	"time"
 
@@ -27,10 +28,10 @@ func NewWriterOpener(discord *discordgo.Session, guildID string, sendTimeout tim
 	}
 }
 
-// Open
+// Open implements the player.WriterOpener interface.
 // Open will recycle the previous Writer if it is still open to the same channel.
-func (o *WriterOpener) Open(channelID string) (*Writer, error) {
-	if !validVoiceChannel(o.discord, channelID) {
+func (o *WriterOpener) Open(channelID string) (io.WriteCloser, error) {
+	if !ValidVoiceChannel(o.discord, channelID) {
 		return nil, ErrInvalidVoiceChannel
 	}
 	o.mu.Lock()
@@ -43,6 +44,7 @@ func (o *WriterOpener) Open(channelID string) (*Writer, error) {
 		}
 		o.writer = &Writer{channelID, o.sendTimeout, vconn}
 	}
+	o.writer.vconn.Speaking(true)
 	return o.writer, nil
 }
 
@@ -67,6 +69,7 @@ func (w *Writer) Write(p []byte) (n int, err error) {
 		err = errors.New("voice connection closed")
 		return
 	}
+
 	select {
 	case w.vconn.OpusSend <- p:
 		n = len(p)
@@ -78,10 +81,11 @@ func (w *Writer) Write(p []byte) (n int, err error) {
 }
 
 func (w *Writer) Close() error {
+	w.vconn.Speaking(false)
 	return w.vconn.Disconnect()
 }
 
-func validVoiceChannel(discord *discordgo.Session, channelID string) bool {
+func ValidVoiceChannel(discord *discordgo.Session, channelID string) bool {
 	channel, err := discord.State.Channel(channelID)
 	if err != nil {
 		channel, err = discord.Channel(channelID)
