@@ -9,6 +9,8 @@ import (
 	"github.com/pkg/errors"
 )
 
+var errSkipped = errors.New("skipped")
+
 func playback(player *Player, opener WriterOpener) {
 	// isIdle := pollTimeout == 0
 	pollTimeout := time.Duration(player.cfg.IdleTimeout) * time.Millisecond
@@ -75,11 +77,6 @@ func openAndPlay(player *Player, song *songItem, opener WriterOpener) (elapsed t
 }
 
 func play(player *Player, src dca.OpusReader, dst io.Writer, cb callbacks) (elapsed time.Duration, err error) {
-	sig := make(chan struct{})
-	close(sig)
-	// playing if ready == sig, paused if ready == nil
-	ready := sig
-
 	var frame []byte
 	nWrites, frameDur := 0, src.FrameDuration()
 
@@ -93,16 +90,22 @@ func play(player *Player, src dca.OpusReader, dst io.Writer, cb callbacks) (elap
 	// drain any buffered control signals (e.g. client called Skip() before any song was queued)
 	drain(player.ctrl)
 
+	// gate reads and writes in order to respect and pause/skip signals
+	ticker := time.NewTicker(frameDur / 2)
+	defer ticker.Stop()
+	// playing if ready == ticker, paused if ready == nil
+	ready := ticker.C
+
 	cb.onStart()
 	for {
 		select {
 		case <-player.quit:
-			err = errors.New("quit")
+			err = ErrClosed
 			return
 		case c := <-player.ctrl:
 			switch c {
 			case skip:
-				err = errors.New("skipped")
+				err = errSkipped
 				return
 			case pause:
 				if ready != nil {
@@ -110,7 +113,7 @@ func play(player *Player, src dca.OpusReader, dst io.Writer, cb callbacks) (elap
 					ready = nil
 				} else {
 					cb.onResume(elapsed)
-					ready = sig
+					ready = ticker.C
 				}
 			}
 		case <-ready:
