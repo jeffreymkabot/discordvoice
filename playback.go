@@ -81,10 +81,11 @@ func play(player *Player, src dca.OpusReader, dst io.Writer, cb callbacks) (elap
 	nWrites, frameDur := 0, src.FrameDuration()
 
 	var writeInterval int
-	var writeTimes []time.Time
+	var writeLatencies []time.Duration
+	var prevWriteTime time.Time
 	if cb.progressInterval > 0 {
 		writeInterval = int(cb.progressInterval / frameDur)
-		writeTimes = make([]time.Time, writeInterval, writeInterval)
+		writeLatencies = make([]time.Duration, 0, writeInterval)
 	}
 
 	// drain any buffered control signals (e.g. client called Skip() before any song was queued)
@@ -139,10 +140,15 @@ func play(player *Player, src dca.OpusReader, dst io.Writer, cb callbacks) (elap
 
 			// only invoke onProgress callback if given a valid progressInterval
 			if writeInterval > 0 {
-				writeTimes[(nWrites-1)%writeInterval] = time.Now()
-				if nWrites > 0 && nWrites%writeInterval == 0 {
-					tmp := make([]time.Time, len(writeTimes), len(writeTimes))
-					copy(tmp, writeTimes)
+				now := time.Now()
+				if !prevWriteTime.IsZero() {
+					writeLatencies = append(writeLatencies, now.Sub(prevWriteTime))
+				}
+				prevWriteTime = now
+				if nWrites%writeInterval == 0 {
+					tmp := make([]time.Duration, len(writeLatencies))
+					copy(tmp, writeLatencies)
+					writeLatencies = writeLatencies[len(writeLatencies):]
 					cb.onProgress(elapsed, tmp)
 				}
 			}

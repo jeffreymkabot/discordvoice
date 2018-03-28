@@ -50,7 +50,7 @@ type callbacks struct {
 	onPause          func(elapsed time.Duration)
 	onResume         func(elapsed time.Duration)
 	progressInterval time.Duration
-	onProgress       func(elapsed time.Duration, frameTimes []time.Time)
+	onProgress       func(elapsed time.Duration, frameTimes []time.Duration)
 	onEnd            func(elapsed time.Duration, err error)
 }
 
@@ -105,7 +105,7 @@ func (p *Player) Enqueue(channelID string, title string, open SongOpenFunc, opts
 		callbacks: callbacks{
 			onStart:    func() {},
 			onEnd:      func(time.Duration, error) {},
-			onProgress: func(time.Duration, []time.Time) {},
+			onProgress: func(time.Duration, []time.Duration) {},
 			onPause:    func(time.Duration) {},
 			onResume:   func(time.Duration) {},
 		},

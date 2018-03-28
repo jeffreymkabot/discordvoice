@@ -85,8 +85,8 @@ func OnEnd(f func(elapsed time.Duration, err error)) SongOption {
 }
 
 // OnProgress sets a function called periodically during the item's playback.
-// The callback receives how long the item has played and a slice frame-to-frame latencies.
-func OnProgress(f func(elapsed time.Duration, frameTime []time.Time), interval time.Duration) SongOption {
+// The callback receives how long the item has played and a slice of frame-to-frame latencies.
+func OnProgress(f func(elapsed time.Duration, frameTime []time.Duration), interval time.Duration) SongOption {
 	return func(s *songItem) {
 		if f != nil {
 			s.onProgress = f
