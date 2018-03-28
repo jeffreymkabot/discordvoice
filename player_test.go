@@ -58,6 +58,7 @@ func TestEnqueuePoll(t *testing.T) {
 		"fail to queue into full queue",
 		"pass directly to first poller",
 		"pass directly to second poller",
+		"do not pass to timed out poller",
 	}
 
 	// queue a song and immediately pause it to freeze playback and prevent queue from being consumed
@@ -150,6 +151,24 @@ func TestEnqueuePoll(t *testing.T) {
 		wg.Done()
 	}()
 	wg.Wait()
+
+	if err := p.Enqueue("", songs[5], nil); err != nil {
+		t.Fatal("failed to queue a song when queue is empty and one poller timed out:", err)
+	}
+	if lst := p.Playlist(); len(lst) != 1 {
+		t.Fatal("expected playlist to have one item after queueing a song after one poller timed out, contains:", lst)
+	}
+	if lst := p.Playlist(); !reflect.DeepEqual(lst, songs[5:6]) {
+		t.Errorf("expected playlist to be %v after queueing a song after one poller timed out, actual %v", songs[5:6], lst)
+	}
+
+	sng, err = p.poll(1)
+	if err != nil {
+		t.Fatal("failed to poll item from non-empty queue after a poller timed out:", err)
+	}
+	if sng.title != songs[5] {
+		t.Errorf("expected polled item to have title %v, actual %v", songs[5], sng.title)
+	}
 }
 
 func TestClose(t *testing.T) {

@@ -8,7 +8,7 @@ import (
 	"github.com/pkg/errors"
 )
 
-const Version = "0.4.0"
+const Version = "0.4.1"
 
 // Player errors
 var (
@@ -156,9 +156,10 @@ func (p *Player) poll(timeout time.Duration) (*songItem, error) {
 	}
 
 	// add me to the list of waiters and wait for a song
-	// buffered so enqueue does not wait for me
+	// input channel must not be buffered so the closed dead channel takes priority in Enqueue's select statement
+	// otherwise Enqueue would randomly pass to dead pollers :(
 	me := waiter{
-		input: make(chan *songItem, 1),
+		input: make(chan *songItem),
 		dead:  make(chan struct{}),
 	}
 	p.waiters = append(p.waiters, me)
