@@ -12,13 +12,14 @@ const Version = "0.4.1"
 
 // Player errors
 var (
-	ErrFull   = errors.New("queue is full")
-	ErrClosed = errors.New("player is closed")
+	ErrFull    = errors.New("queue is full")
+	ErrClosed  = errors.New("player is closed")
+	ErrCleared = errors.New("cleared")
+	ErrSkipped = errors.New("skipped")
 )
 
 var (
 	errPollTimeout = errors.New("poll timeout")
-	errCleared     = errors.New("cleared")
 )
 
 // Player
@@ -193,7 +194,7 @@ func (p *Player) Playlist() []string {
 func (p *Player) Clear() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.clear(errCleared)
+	p.clear(ErrCleared)
 }
 
 func (play *Player) clear(reason error) {

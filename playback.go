@@ -9,8 +9,6 @@ import (
 	"github.com/pkg/errors"
 )
 
-var errSkipped = errors.New("skipped")
-
 func playback(player *Player, opener WriterOpener) {
 	// isIdle := pollTimeout == 0
 	pollTimeout := time.Duration(player.cfg.IdleTimeout) * time.Millisecond
@@ -106,7 +104,7 @@ func play(player *Player, src dca.OpusReader, dst io.Writer, cb callbacks) (elap
 		case c := <-player.ctrl:
 			switch c {
 			case skip:
-				err = errSkipped
+				err = ErrSkipped
 				return
 			case pause:
 				if ready != nil {
