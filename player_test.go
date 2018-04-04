@@ -45,7 +45,8 @@ func TestCallbacks(t *testing.T) {
 	var pauseTime time.Duration
 	var resumeTime time.Duration
 	var endErr error
-	err := p.Enqueue("", "", nopSongOpener, player.PreEncoded(),
+	err := p.Enqueue("", "", nopSongOpener,
+		player.PreEncoded(),
 		player.OnStart(func() {
 			calledOnStart = true
 			p.Pause()
@@ -100,13 +101,14 @@ func TestSkip(t *testing.T) {
 	waitForPause.Add(1)
 	waitForEnd.Add(1)
 	err := p.Enqueue("", "", nopSongOpener,
+		player.PreEncoded(),
 		player.OnStart(func() {
 			p.Pause()
 		}),
-		player.OnPause(func(e time.Duration) {
+		player.OnPause(func(_ time.Duration) {
 			waitForPause.Done()
 		}),
-		player.OnEnd(func(e time.Duration, err error) {
+		player.OnEnd(func(_ time.Duration, err error) {
 			endErr = errors.Cause(err)
 			waitForEnd.Done()
 		}),

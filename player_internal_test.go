@@ -58,7 +58,14 @@ func TestEnqueuePoll(t *testing.T) {
 	// wait for it to be paused
 	var wg sync.WaitGroup
 	wg.Add(1)
-	err := p.Enqueue("", pauseAndBlock, nopSongOpener, OnStart(func() { p.Pause(); wg.Done() }))
+	err := p.Enqueue("", pauseAndBlock, nopSongOpener,
+		PreEncoded(),
+		OnStart(func() {
+			p.Pause()
+		}),
+		OnPause(func(_ time.Duration) {
+			wg.Done()
+		}))
 	require.NoError(t, err, "failed to queue a song into empty queue")
 	wg.Wait()
 	require.Empty(t, p.queue, "expected queue to be empty after the only queued song has started")
@@ -90,8 +97,10 @@ func TestEnqueuePoll(t *testing.T) {
 		assert.Equal(t, passToFirstPoller, sng.title)
 		wg.Done()
 	}()
-	wg.Wait()
+	wg.Wait()    // give a chance for the first poller goroutine to execute
+	p.mu.RLock() // avoid data race with first poller goroutine
 	require.Len(t, p.waiters, 1, "expected one poller waiting for an item")
+	p.mu.RUnlock()
 
 	wg.Add(1)
 	go func() {
@@ -101,8 +110,10 @@ func TestEnqueuePoll(t *testing.T) {
 		assert.Equal(t, passToSecondPoller, sng.title)
 		wg.Done()
 	}()
-	wg.Wait()
+	wg.Wait()    // give a chance for the second poller goroutine to execute
+	p.mu.RLock() // avoid data race with second poller goroutine
 	require.Len(t, p.waiters, 2, "expected two pollers waiting for an item")
+	p.mu.RUnlock()
 
 	// queue two songs and wait for poller goroutines to receive them
 	wg.Add(2)
@@ -171,11 +182,14 @@ func TestClose(t *testing.T) {
 
 	wg.Add(1)
 	err = p.Enqueue("", "pause and block playback", nopSongOpener,
+		PreEncoded(),
 		OnStart(func() {
 			p.Pause()
+		}),
+		OnPause(func(_ time.Duration) {
 			wg.Done()
 		}),
-		OnEnd(func(e time.Duration, err error) {
+		OnEnd(func(_ time.Duration, err error) {
 			endErr := errors.Cause(err)
 			assert.Equal(t, ErrClosed, endErr, "close should skip the currently playing song, even if paused")
 		}),
@@ -216,11 +230,14 @@ func TestPlaylistAndClear(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(1)
 	err := p.Enqueue("", "", nopSongOpener,
+		PreEncoded(),
 		OnStart(func() {
 			p.Pause()
+		}),
+		OnPause(func(_ time.Duration) {
 			wg.Done()
 		}),
-		OnEnd(func(e time.Duration, err error) {
+		OnEnd(func(_ time.Duration, err error) {
 			songEnded = true
 		}))
 	require.NoError(t, err)
