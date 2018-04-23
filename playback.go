@@ -9,7 +9,8 @@ import (
 	"github.com/pkg/errors"
 )
 
-func playback(player *Player, opener WriterOpener) {
+func playback(player *Player, device Device) {
+	player.wg.Add(1)
 	// isIdle := pollTimeout == 0
 	pollTimeout := time.Duration(player.cfg.IdleTimeout) * time.Millisecond
 
@@ -20,26 +21,34 @@ func playback(player *Player, opener WriterOpener) {
 			player.cfg.Idle()
 			continue
 		} else if err != nil {
+			if player.writer != nil {
+				player.writer.Close()
+			}
+			player.wg.Done()
 			return
 		}
 		pollTimeout = time.Duration(player.cfg.IdleTimeout) * time.Millisecond
 
 		player.wg.Add(1)
-		elapsed, err := openAndPlay(player, song, opener)
+		elapsed, err := openAndPlay(player, song, device)
 		song.onEnd(elapsed, err)
 		player.wg.Done()
 	}
 }
 
-func openAndPlay(player *Player, song *songItem, opener WriterOpener) (elapsed time.Duration, err error) {
+func openAndPlay(player *Player, song *songItem, device Device) (elapsed time.Duration, err error) {
 	var reader dca.OpusReader
 	var writer io.WriteCloser
 
-	writer, err = opener.Open(song.channelID)
+	// TODO consider how to manage closing abstract writers and not just discord voice channels
+	writer, err = device.Open(song.channelID)
 	if err != nil {
 		err = errors.Wrap(err, "failed to join song channel")
 		return
 	}
+	// keep track of the open writer
+
+	player.writer = writer
 
 	rc, err := song.open()
 	if err != nil {

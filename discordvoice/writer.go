@@ -11,8 +11,8 @@ import (
 
 var ErrInvalidVoiceChannel = errors.New("invalid voice channel")
 
-// WriterOpener
-type WriterOpener struct {
+// Device
+type Device struct {
 	guildID     string
 	sendTimeout time.Duration
 	discord     *discordgo.Session
@@ -20,64 +20,96 @@ type WriterOpener struct {
 	writer      *Writer
 }
 
-func NewWriterOpener(discord *discordgo.Session, guildID string, sendTimeout time.Duration) *WriterOpener {
-	return &WriterOpener{
+
+func New(discord *discordgo.Session, guildID string, sendTimeout time.Duration) *Device {
+	return &Device{
 		guildID:     guildID,
 		sendTimeout: sendTimeout,
 		discord:     discord,
 	}
 }
 
-// Open implements the player.WriterOpener interface.
+// Open implements the player.Device interface.
 // Open will recycle the previous Writer if it is still open to the same channel.
-func (o *WriterOpener) Open(channelID string) (io.WriteCloser, error) {
-	if !ValidVoiceChannel(o.discord, channelID) {
+func (d *Device) Open(channelID string) (io.WriteCloser, error) {
+	if !ValidVoiceChannel(d.discord, channelID) {
 		return nil, ErrInvalidVoiceChannel
 	}
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	if o.writer == nil || o.writer.channelID != channelID || !o.writer.ready() {
-		vconn, err := o.discord.ChannelVoiceJoin(o.guildID, channelID, false, true)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.writer == nil || d.writer.channelID != channelID || !d.writer.Ready() {
+		vconn, err := d.discord.ChannelVoiceJoin(d.guildID, channelID, false, true)
 		if err != nil {
-			o.writer = nil
+			d.writer = nil
 			return nil, errors.Wrap(err, "failed to join discord channel")
 		}
-		o.writer = &Writer{channelID, o.sendTimeout, vconn}
+		d.writer = &Writer{
+			guildID:     d.guildID,
+			channelID:   channelID,
+			sendTimeout: d.sendTimeout,
+			discord:     d.discord,
+			vconn:       vconn,
+		}
 	}
-	o.writer.vconn.Speaking(true)
-	return o.writer, nil
+	d.writer.vconn.Speaking(true)
+	return d.writer, nil
 }
 
 // Writer
 type Writer struct {
+	guildID     string
 	channelID   string
 	sendTimeout time.Duration
+	discord     *discordgo.Session
+	mu          sync.Mutex
 	vconn       *discordgo.VoiceConnection
 }
 
+func (w *Writer) Ready() bool {
+	w.vconn.RWMutex.RLock()
+	defer w.vconn.RWMutex.RUnlock()
+	return w.ready()
+}
+
+// check that the channel hasn't changed under our nose
+// e.g. websocket error or a user dragging us into a different channel?
 func (w *Writer) ready() bool {
-	w.vconn.RLock()
-	defer w.vconn.RUnlock()
-	// check that the channel hasn't changed under our nose
-	// e.g. a user dragging us into a different channel?
 	return w.vconn.ChannelID == w.channelID && w.vconn.Ready
 }
 
 // TODO writer intelligently calls vconn.Speaking(true/false) before/after writing
 func (w *Writer) Write(p []byte) (n int, err error) {
-	if !w.ready() {
+	if !w.Ready() {
+		// TODO attempt reconnect, could just skip checking ready and let the channel send timeout
 		err = errors.New("voice connection closed")
 		return
 	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.write(p, true)
+}
 
+func (w *Writer) write(p []byte, retryOnTimeout bool) (n int, err error) {
 	select {
 	case w.vconn.OpusSend <- p:
-		n = len(p)
-		return
+		return len(p), nil
 	case <-time.After(w.sendTimeout):
-		err = errors.Errorf("send timeout on voice connection after %vms", w.sendTimeout)
-		return
+		if !retryOnTimeout {
+			err = errors.Errorf("send timeout on voice connection after %v", w.sendTimeout)
+			return 0, err
+		}
+		vconn, err := w.reconnect()
+		if err != nil {
+			return 0, err
+		}
+		w.vconn = vconn
+		return w.write(p, false)
 	}
+}
+
+func (w *Writer) reconnect() (*discordgo.VoiceConnection, error) {
+	w.vconn.Disconnect()
+	return w.discord.ChannelVoiceJoin(w.guildID, w.channelID, false, true)
 }
 
 func (w *Writer) Close() error {
@@ -90,5 +122,10 @@ func ValidVoiceChannel(discord *discordgo.Session, channelID string) bool {
 	if err != nil {
 		channel, err = discord.Channel(channelID)
 	}
-	return err == nil && channel.Type == discordgo.ChannelTypeGuildVoice
+	if err != nil {
+		return false
+	}
+	// add this channel to State to speed up next query
+	discord.State.ChannelAdd(channel)
+	return channel.Type == discordgo.ChannelTypeGuildVoice
 }

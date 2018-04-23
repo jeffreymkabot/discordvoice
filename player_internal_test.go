@@ -13,9 +13,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-type nopWriterOpener struct{}
+type nopDevice struct{}
 
-func (o *nopWriterOpener) Open(x string) (io.WriteCloser, error) {
+func (d *nopDevice) Open(x string) (io.WriteCloser, error) {
 	return nopWriter{ioutil.Discard}, nil
 }
 
@@ -32,7 +32,7 @@ var nopSongOpener = func() (io.ReadCloser, error) {
 func TestNewPlayer(t *testing.T) {
 	t.Parallel()
 	calledIdle := false
-	p := New(&nopWriterOpener{}, IdleFunc(func() { calledIdle = true }, 1))
+	p := New(&nopDevice{}, IdleFunc(func() { calledIdle = true }, 1))
 	require.NotNil(t, p)
 	defer p.Close()
 
@@ -42,7 +42,7 @@ func TestNewPlayer(t *testing.T) {
 
 func TestEnqueuePoll(t *testing.T) {
 	t.Parallel()
-	p := New(&nopWriterOpener{}, QueueLength(1))
+	p := New(&nopDevice{}, QueueLength(1))
 	require.NotNil(t, p)
 	defer p.Close()
 	require.Empty(t, p.queue)
@@ -147,7 +147,7 @@ func TestEnqueuePoll(t *testing.T) {
 
 func TestClose(t *testing.T) {
 	t.Parallel()
-	p := New(&nopWriterOpener{})
+	p := New(&nopDevice{})
 	require.NotNil(t, p)
 
 	// open pollers should die when player is closed
@@ -176,7 +176,7 @@ func TestClose(t *testing.T) {
 	assert.Equal(t, ErrClosed, p.Close())
 
 	// close should empty the queue and skip the currently playing song
-	p = New(&nopWriterOpener{}, QueueLength(1))
+	p = New(&nopDevice{}, QueueLength(1))
 	require.NotNil(t, p)
 	require.Empty(t, p.queue)
 
@@ -220,7 +220,7 @@ func TestPlaylistAndClear(t *testing.T) {
 		"qux",
 	}
 	t.Parallel()
-	p := New(&nopWriterOpener{}, QueueLength(len(songs)))
+	p := New(&nopDevice{}, QueueLength(len(songs)))
 	require.NotNil(t, p)
 	defer p.Close()
 

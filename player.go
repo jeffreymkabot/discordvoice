@@ -28,6 +28,9 @@ type Player struct {
 	quit chan struct{}
 	wg   sync.WaitGroup
 
+	// resource possibly opened by playback goroutine
+	writer io.WriteCloser
+
 	mu      sync.RWMutex
 	queue   []*songItem
 	waiters []waiter
@@ -60,11 +63,11 @@ type waiter struct {
 	input chan *songItem
 }
 
-type WriterOpener interface {
+type Device interface {
 	Open(channelID string) (io.WriteCloser, error)
 }
 
-func New(opener WriterOpener, opts ...PlayerOption) *Player {
+func New(device Device, opts ...PlayerOption) *Player {
 	cfg := PlayerConfig{Idle: func() {}}
 	for _, opt := range opts {
 		opt(&cfg)
@@ -78,7 +81,7 @@ func New(opener WriterOpener, opts ...PlayerOption) *Player {
 	}
 
 	player.cfg.Idle()
-	go playback(player, opener)
+	go playback(player, device)
 
 	return player
 }
@@ -136,10 +139,8 @@ func (p *Player) Enqueue(channelID string, title string, open SongOpenFunc, opts
 
 // poll blocks until an item is queued, player is closed, or timeout has passed if timeout > 0
 func (p *Player) poll(timeout time.Duration) (*songItem, error) {
-	p.mu.Lock()
 	select {
 	case <-p.quit:
-		p.mu.Unlock()
 		return nil, ErrClosed
 	default:
 	}
@@ -149,6 +150,7 @@ func (p *Player) poll(timeout time.Duration) (*songItem, error) {
 		deadline = time.NewTimer(timeout).C
 	}
 
+	p.mu.Lock()
 	if len(p.queue) > 0 {
 		song := p.queue[0]
 		p.queue = p.queue[1:]
@@ -168,6 +170,7 @@ func (p *Player) poll(timeout time.Duration) (*songItem, error) {
 
 	select {
 	case <-p.quit:
+		close(me.dead)
 		return nil, ErrClosed
 	case <-deadline:
 		// make sure enqueue does not consider me eligible anymore
@@ -197,27 +200,27 @@ func (p *Player) Clear() {
 	p.clear(ErrCleared)
 }
 
-func (play *Player) clear(reason error) {
-	for _, s := range play.queue {
+func (p *Player) clear(reason error) {
+	for _, s := range p.queue {
 		s.onEnd(0, reason)
 	}
-	play.queue = nil
+	p.queue = nil
 }
 
 // Skip the currently playing or paused item.
-func (play *Player) Skip() {
+func (p *Player) Skip() {
 	// ctrl channel is buffered to 1
 	select {
-	case play.ctrl <- skip:
+	case p.ctrl <- skip:
 	default:
 	}
 }
 
 // Pause the currently playing item or resume the currently paused item.
-func (play *Player) Pause() {
+func (p *Player) Pause() {
 	// ctrl channel is buffered to 1
 	select {
-	case play.ctrl <- pause:
+	case p.ctrl <- pause:
 	default:
 	}
 }
@@ -225,20 +228,20 @@ func (play *Player) Pause() {
 // Close releases the resources for the player and all queued items.
 // Close will block until all OnEnd callbacks have returned.
 // You should call Close before opening another Player targetting the same resources.
-func (play *Player) Close() error {
-	play.mu.Lock()
-	defer play.mu.Unlock()
+func (p *Player) Close() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	select {
-	case <-play.quit:
+	case <-p.quit:
 		return ErrClosed
 	default:
 	}
 
-	close(play.quit)
+	close(p.quit)
 	// clear calls onEnd callbacks of queued songs
-	play.clear(ErrClosed)
+	p.clear(ErrClosed)
 	// wait for onEnd callback of currently playing song
-	play.wg.Wait()
+	p.wg.Wait()
 	return nil
 }
 
