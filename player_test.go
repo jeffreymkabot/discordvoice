@@ -16,18 +16,12 @@ import (
 
 type nopWriterOpener struct{}
 
-func (o *nopWriterOpener) Open(x string) (io.WriteCloser, error) {
-	return nopWriter{ioutil.Discard}, nil
+func (o *nopWriterOpener) Open(x string) (io.Writer, error) {
+	return ioutil.Discard, nil
 }
 
-type nopWriter struct {
-	io.Writer
-}
-
-func (w nopWriter) Close() error { return nil }
-
-var nopSongOpener player.SongOpenerFunc = func() (io.ReadCloser, error) {
-	return ioutil.NopCloser(strings.NewReader("hello world")), nil
+var nopSongOpener player.SongOpenerFunc = func() (io.Reader, error) {
+	return strings.NewReader("hello world"), nil
 }
 
 func TestCallbacks(t *testing.T) {

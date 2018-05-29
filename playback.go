@@ -21,8 +21,8 @@ func playback(player *Player, device Device) {
 			player.cfg.Idle()
 			continue
 		} else if err != nil {
-			if player.writer != nil {
-				player.writer.Close()
+			if wc, ok := player.writer.(io.Closer); ok {
+				wc.Close()
 			}
 			player.wg.Done()
 			return
@@ -38,7 +38,7 @@ func playback(player *Player, device Device) {
 
 func openAndPlay(player *Player, song *songItem, device Device) (elapsed time.Duration, err error) {
 	var reader dca.OpusReader
-	var writer io.WriteCloser
+	var writer io.Writer
 
 	// TODO consider how to manage closing abstract writers and not just discord voice channels
 	writer, err = device.Open(song.channelID)
@@ -46,8 +46,8 @@ func openAndPlay(player *Player, song *songItem, device Device) (elapsed time.Du
 		err = errors.Wrap(err, "failed to join song channel")
 		return
 	}
-	// keep track of the open writer
 
+	// keep track of the open writer so it can get closed when the player closes if is a closer
 	player.writer = writer
 
 	rc, err := song.open()
@@ -55,7 +55,9 @@ func openAndPlay(player *Player, song *songItem, device Device) (elapsed time.Du
 		err = errors.Wrap(err, "failed to open song")
 		return
 	}
-	defer rc.Close()
+	if rc, ok := rc.(io.Closer); ok {
+		defer rc.Close()
+	}
 
 	if song.preencoded {
 		reader = dca.NewDecoder(rc)

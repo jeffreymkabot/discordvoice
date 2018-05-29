@@ -31,8 +31,8 @@ type Player struct {
 	quit chan struct{}
 	wg   sync.WaitGroup
 
-	// resource possibly opened by playback goroutine
-	writer io.WriteCloser
+	// device resource possibly opened by playback goroutine
+	writer io.Writer
 
 	mu      sync.RWMutex
 	queue   []*songItem
@@ -41,13 +41,14 @@ type Player struct {
 }
 
 // Device provides the writer for playback.
+// If the writer also implements io.Closer it will be closed when the player is closed.
 type Device interface {
-	Open(channelID string) (io.WriteCloser, error)
+	Open(channelID string) (io.Writer, error)
 }
 
 // SongOpenerFunc opens an audio stream.
-type SongOpenerFunc func() (io.ReadCloser, error)
-
+// If the reader also implements io.Closer it will be closed after playback.
+type SongOpenerFunc func() (io.Reader, error)
 
 type songItem struct {
 	channelID string
