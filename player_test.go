@@ -26,7 +26,7 @@ type nopWriter struct {
 
 func (w nopWriter) Close() error { return nil }
 
-var nopSongOpener = func() (io.ReadCloser, error) {
+var nopSongOpener player.SongOpenerFunc = func() (io.ReadCloser, error) {
 	return ioutil.NopCloser(strings.NewReader("hello world")), nil
 }
 

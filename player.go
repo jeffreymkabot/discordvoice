@@ -1,3 +1,4 @@
+// Package player provides controllable queued playback of streams to an audio device.
 package player
 
 import (
@@ -8,6 +9,7 @@ import (
 	"github.com/pkg/errors"
 )
 
+// Version follows semantic versioning.
 const Version = "0.4.1"
 
 // Player errors
@@ -22,9 +24,10 @@ var (
 	errPollTimeout = errors.New("poll timeout")
 )
 
-// Player
+// Player provides controllable playback to the provided audio device via a queue.
+// Player is safe to use in multiple goroutines.
 type Player struct {
-	cfg  *PlayerConfig
+	cfg  *config
 	quit chan struct{}
 	wg   sync.WaitGroup
 
@@ -37,9 +40,18 @@ type Player struct {
 	ctrl    chan control
 }
 
+// Device provides the writer for playback.
+type Device interface {
+	Open(channelID string) (io.WriteCloser, error)
+}
+
+// SongOpenerFunc opens an audio stream.
+type SongOpenerFunc func() (io.ReadCloser, error)
+
+
 type songItem struct {
 	channelID string
-	open      SongOpenFunc
+	open      SongOpenerFunc
 	title     string
 
 	preencoded bool
@@ -63,12 +75,10 @@ type waiter struct {
 	input chan *songItem
 }
 
-type Device interface {
-	Open(channelID string) (io.WriteCloser, error)
-}
-
-func New(device Device, opts ...PlayerOption) *Player {
-	cfg := PlayerConfig{Idle: func() {}}
+// New creates a Player that plays songs to the provided device.
+// Be sure to call Player.Close to clean up resources.
+func New(device Device, opts ...Option) *Player {
+	cfg := config{Idle: func() {}}
 	for _, opt := range opts {
 		opt(&cfg)
 	}
@@ -86,10 +96,8 @@ func New(device Device, opts ...PlayerOption) *Player {
 	return player
 }
 
-type SongOpenFunc func() (io.ReadCloser, error)
-
 // Enqueue puts an item at the end of the queue.
-func (p *Player) Enqueue(channelID string, title string, open SongOpenFunc, opts ...SongOption) error {
+func (p *Player) Enqueue(channelID string, title string, open SongOpenerFunc, opts ...SongOption) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	select {

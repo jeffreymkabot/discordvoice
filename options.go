@@ -2,27 +2,27 @@ package player
 
 import "time"
 
-// PlayerConfig sets some behaviors of the Player.
-type PlayerConfig struct {
+type config struct {
 	QueueLength int
 	Idle        func()
 	IdleTimeout int
 }
 
-// PlayerOptions set up the PlayerConfig.
-type PlayerOption func(*PlayerConfig)
+// Option functions configure behaviors of the Player.
+// Pass Options to the New function.
+type Option func(*config)
 
-// QueueLength is the maximum number of items that will be allowed in the player queue.
+// QueueLength is the maximum number of items that will be allowed in the Player queue.
 // Values less than 1 allow an unbounded queue.
-func QueueLength(n int) PlayerOption {
-	return func(cfg *PlayerConfig) {
+func QueueLength(n int) Option {
+	return func(cfg *config) {
 		cfg.QueueLength = n
 	}
 }
 
 // IdleFunc sets a function that is called if the player does not receive another item for d milliseconds.
-func IdleFunc(idle func(), d int) PlayerOption {
-	return func(cfg *PlayerConfig) {
+func IdleFunc(idle func(), d int) Option {
+	return func(cfg *config) {
 		if d > 0 && idle != nil {
 			cfg.Idle = idle
 			cfg.IdleTimeout = d
@@ -30,7 +30,8 @@ func IdleFunc(idle func(), d int) PlayerOption {
 	}
 }
 
-// SongOptions set up the playback of individual items.
+// SongOption functions configure the playback of individual items.
+// Pass SongOptions to the Player.Enqueue function.
 type SongOption func(*songItem)
 
 // PreEncoded causes the item not to be passed through ffmpeg for playback.
@@ -73,9 +74,10 @@ func OnStart(f func()) SongOption {
 	}
 }
 
-// OnEnd sets a function that is called when the item's playback ends.
+// OnEnd sets a function that is called when the item's playback ends or is for any reason canceled.
 // The callback receives how long the item played and an error detailing why the playback ended.
-// The error is never nil.
+// The error is never nil and OnEnd is always called, even if the song never started,
+// for example if it was cleared from the playlist or the player closed.
 func OnEnd(f func(elapsed time.Duration, err error)) SongOption {
 	return func(s *songItem) {
 		if f != nil {
