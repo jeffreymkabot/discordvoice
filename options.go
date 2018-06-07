@@ -34,10 +34,9 @@ func IdleFunc(idle func(), d int) Option {
 // Pass SongOptions to the Player.Enqueue function.
 type SongOption func(*songItem)
 
-// PreEncoded causes the item not to be passed through ffmpeg for playback.
-func PreEncoded() SongOption {
+func Encoder(f EncodeFunc) SongOption {
 	return func(s *songItem) {
-		s.preencoded = true
+		s.encoder = f
 	}
 }
 

@@ -40,24 +40,34 @@ type Player struct {
 	ctrl    chan control
 }
 
-// Device provides the writer for playback.
+// DeviceOpenerFunc provides the writer for playback.
 // If the writer also implements io.Closer it will be closed when the player is closed.
-type Device interface {
-	Open(channelID string) (io.Writer, error)
-}
+type DeviceOpenerFunc func() (io.Writer, error)
 
 // SongOpenerFunc opens an audio stream.
 // If the reader also implements io.Closer it will be closed after playback.
 type SongOpenerFunc func() (io.Reader, error)
 
-type songItem struct {
-	channelID string
-	open      SongOpenerFunc
-	title     string
+type EncodeFunc func(io.Reader) (Source, error)
 
-	preencoded bool
-	loudness   float64
-	filters    string
+type Source interface {
+	ReadFrame() ([]byte, error)
+	FrameDuration() time.Duration
+}
+
+type SourceCloser interface {
+	Source
+	io.Closer
+}
+
+type songItem struct {
+	openSrc SongOpenerFunc
+	openDst DeviceOpenerFunc
+	title   string
+
+	encoder  EncodeFunc
+	loudness float64
+	filters  string
 	callbacks
 }
 
@@ -76,9 +86,9 @@ type waiter struct {
 	input chan *songItem
 }
 
-// New creates a Player that plays songs to the provided device.
-// Be sure to call Player.Close to clean up resources.
-func New(device Device, opts ...Option) *Player {
+// New creates a Player.
+// Be sure to call Player.Close to clean up any resources.
+func New(opts ...Option) *Player {
 	cfg := config{Idle: func() {}}
 	for _, opt := range opts {
 		opt(&cfg)
@@ -87,18 +97,18 @@ func New(device Device, opts ...Option) *Player {
 	player := &Player{
 		cfg:  &cfg,
 		quit: make(chan struct{}),
-		// buffered so Skip()/Pause() do not wait if busy
+		// buffered so Skip()/Pause() do not wait for if playback is busy reading/writing
 		ctrl: make(chan control, 1),
 	}
 
 	player.cfg.Idle()
-	go playback(player, device)
+	go player.playback()
 
 	return player
 }
 
 // Enqueue puts an item at the end of the queue.
-func (p *Player) Enqueue(channelID string, title string, open SongOpenerFunc, opts ...SongOption) error {
+func (p *Player) Enqueue(title string, openSrc SongOpenerFunc, openDst DeviceOpenerFunc, opts ...SongOption) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	select {
@@ -112,9 +122,9 @@ func (p *Player) Enqueue(channelID string, title string, open SongOpenerFunc, op
 	}
 
 	song := &songItem{
-		channelID: channelID,
-		open:      open,
-		title:     title,
+		openSrc: openSrc,
+		openDst: openDst,
+		title:   title,
 		callbacks: callbacks{
 			onStart:    func() {},
 			onEnd:      func(time.Duration, error) {},

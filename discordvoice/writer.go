@@ -20,7 +20,6 @@ type Device struct {
 	writer      *Writer
 }
 
-
 func New(discord *discordgo.Session, guildID string, sendTimeout time.Duration) *Device {
 	return &Device{
 		guildID:     guildID,
@@ -31,7 +30,7 @@ func New(discord *discordgo.Session, guildID string, sendTimeout time.Duration) 
 
 // Open implements the player.Device interface.
 // Open will recycle the previous Writer if it is still open to the same channel.
-func (d *Device) Open(channelID string) (io.WriteCloser, error) {
+func (d *Device) Open(channelID string) (io.Writer, error) {
 	if !ValidVoiceChannel(d.discord, channelID) {
 		return nil, ErrInvalidVoiceChannel
 	}

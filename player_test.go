@@ -14,9 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-type nopWriterOpener struct{}
-
-func (o *nopWriterOpener) Open(x string) (io.Writer, error) {
+var nopDeviceWriter = func() (io.Writer, error) {
 	return ioutil.Discard, nil
 }
 
@@ -24,9 +22,20 @@ var nopSongOpener player.SongOpenerFunc = func() (io.Reader, error) {
 	return strings.NewReader("hello world"), nil
 }
 
+func TestNewPlayer(t *testing.T) {
+	t.Parallel()
+	calledIdle := false
+	p := player.New(player.IdleFunc(func() { calledIdle = true }, 1))
+	require.NotNil(t, p)
+	defer p.Close()
+
+	assert.True(t, calledIdle, "did not call idle func")
+	assert.Empty(t, p.Playlist(), "playlist is not empty")
+}
+
 func TestCallbacks(t *testing.T) {
 	t.Parallel()
-	p := player.New(&nopWriterOpener{}, player.QueueLength(1))
+	p := player.New(player.QueueLength(1))
 	require.NotNil(t, p)
 	defer p.Close()
 
@@ -39,8 +48,7 @@ func TestCallbacks(t *testing.T) {
 	var pauseTime time.Duration
 	var resumeTime time.Duration
 	var endErr error
-	err := p.Enqueue("", "", nopSongOpener,
-		player.PreEncoded(),
+	err := p.Enqueue("", nopSongOpener, nopDeviceWriter,
 		player.OnStart(func() {
 			calledOnStart = true
 			p.Pause()
@@ -85,7 +93,7 @@ func TestCallbacks(t *testing.T) {
 
 func TestSkip(t *testing.T) {
 	t.Parallel()
-	p := player.New(&nopWriterOpener{}, player.QueueLength(1))
+	p := player.New(player.QueueLength(1))
 	require.NotNil(t, p)
 	defer p.Close()
 
@@ -94,8 +102,7 @@ func TestSkip(t *testing.T) {
 	var waitForEnd sync.WaitGroup
 	waitForPause.Add(1)
 	waitForEnd.Add(1)
-	err := p.Enqueue("", "", nopSongOpener,
-		player.PreEncoded(),
+	err := p.Enqueue("", nopSongOpener, nopDeviceWriter,
 		player.OnStart(func() {
 			p.Pause()
 		}),

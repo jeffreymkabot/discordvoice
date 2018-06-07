@@ -13,9 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-type nopDevice struct{}
-
-func (d *nopDevice) Open(x string) (io.Writer, error) {
+var nopDeviceWriter = func() (io.Writer, error) {
 	return ioutil.Discard, nil
 }
 
@@ -23,22 +21,13 @@ var nopSongOpener SongOpenerFunc = func() (io.Reader, error) {
 	return strings.NewReader("hello world"), nil
 }
 
-func TestNewPlayer(t *testing.T) {
-	t.Parallel()
-	calledIdle := false
-	p := New(&nopDevice{}, IdleFunc(func() { calledIdle = true }, 1))
-	require.NotNil(t, p)
-	defer p.Close()
-
-	assert.True(t, calledIdle, "did not call idle func")
-	assert.Empty(t, p.Playlist(), "playlist is not empty")
-}
-
 func TestEnqueuePoll(t *testing.T) {
 	t.Parallel()
-	p := New(&nopDevice{}, QueueLength(1))
+
+	p := New(QueueLength(1))
 	require.NotNil(t, p)
 	defer p.Close()
+
 	require.Empty(t, p.queue)
 
 	pauseAndBlock := "pause and block playback"
@@ -50,27 +39,26 @@ func TestEnqueuePoll(t *testing.T) {
 
 	// queue a song and immediately pause it to freeze playback and prevent queue from being consumed
 	// wait for it to be paused
-	var wg sync.WaitGroup
-	wg.Add(1)
-	err := p.Enqueue("", pauseAndBlock, nopSongOpener,
-		PreEncoded(),
+	var waitForPause sync.WaitGroup
+	waitForPause.Add(1)
+	err := p.Enqueue(pauseAndBlock, nopSongOpener, nopDeviceWriter,
 		OnStart(func() {
 			p.Pause()
 		}),
 		OnPause(func(_ time.Duration) {
-			wg.Done()
+			waitForPause.Done()
 		}))
 	require.NoError(t, err, "failed to queue a song into empty queue")
-	wg.Wait()
+	waitForPause.Wait()
 	require.Empty(t, p.queue, "expected queue to be empty after the only queued song has started")
 
 	// queue a song
-	err = p.Enqueue("", enqueueOne, nil)
+	err = p.Enqueue(enqueueOne, nil, nil)
 	require.NoError(t, err, "failed to queue a song into empty queue")
 	assert.Len(t, p.queue, 1)
 
 	// queue should be full
-	err = p.Enqueue("", failToQueue, nil)
+	err = p.Enqueue(failToQueue, nil, nil)
 	require.Error(t, err)
 	assert.Equal(t, ErrFull, err)
 
@@ -83,53 +71,50 @@ func TestEnqueuePoll(t *testing.T) {
 	// set up two routines that poll indefinitely for queued songs
 	// wait for poller goroutines to begin execution
 	// make sure poller goroutines execute in order
-	wg.Add(1)
+	var waitForPollers sync.WaitGroup
+	waitForPollers.Add(1)
 	go func() {
-		wg.Done()
+		waitForPollers.Done()
 		sng, err := p.poll(0)
 		require.NoError(t, err, "failed to poll item from queue")
 		assert.Equal(t, passToFirstPoller, sng.title)
-		wg.Done()
+		waitForPollers.Done()
 	}()
-	wg.Wait()    // give a chance for the first poller goroutine to execute
-	p.mu.RLock() // avoid data race with first poller goroutine
+	waitForPollers.Wait() // give a chance for the first poller goroutine to execute
+	p.mu.RLock()          // avoid data race with first poller goroutine
 	require.Len(t, p.waiters, 1, "expected one poller waiting for an item")
 	p.mu.RUnlock()
 
-	wg.Add(1)
+	waitForPollers.Add(1)
 	go func() {
-		wg.Done()
+		waitForPollers.Done()
 		sng, err := p.poll(0)
 		require.NoError(t, err, "failed to poll item from queue")
 		assert.Equal(t, passToSecondPoller, sng.title)
-		wg.Done()
+		waitForPollers.Done()
 	}()
-	wg.Wait()    // give a chance for the second poller goroutine to execute
-	p.mu.RLock() // avoid data race with second poller goroutine
+	waitForPollers.Wait() // give a chance for the second poller goroutine to execute
+	p.mu.RLock()          // avoid data race with second poller goroutine
 	require.Len(t, p.waiters, 2, "expected two pollers waiting for an item")
 	p.mu.RUnlock()
 
 	// queue two songs and wait for poller goroutines to receive them
-	wg.Add(2)
-	err = p.Enqueue("", passToFirstPoller, nil)
+	waitForPollers.Add(2)
+
+	err = p.Enqueue(passToFirstPoller, nil, nil)
 	require.NoError(t, err, "failed to queue into empty queue with two pollers")
 	require.Empty(t, p.queue, "expected to pass item directly to poller")
 
-	err = p.Enqueue("", passToSecondPoller, nil)
+	err = p.Enqueue(passToSecondPoller, nil, nil)
 	require.NoError(t, err, "failed to queue into empty queue with two pollers")
 	require.Empty(t, p.queue, "expected to pass item directly to poller")
-	wg.Wait()
 
-	// poller that should time out
-	wg.Add(1)
-	go func() {
-		_, err := p.poll(1)
-		assert.Equal(t, errPollTimeout, err)
-		wg.Done()
-	}()
-	wg.Wait()
+	waitForPollers.Wait()
 
-	err = p.Enqueue("", ignoreDeadPoller, nil)
+	_, err = p.poll(1)
+	assert.Equal(t, errPollTimeout, err, "expected poll to timeout on empty queue")
+
+	err = p.Enqueue(ignoreDeadPoller, nil, nil)
 	require.NoError(t, err, "failed to queue into empty queue with one timed out poller")
 	require.Len(t, p.queue, 1, "expected to pass song into queue instead of timed out poller")
 
@@ -141,7 +126,7 @@ func TestEnqueuePoll(t *testing.T) {
 
 func TestClose(t *testing.T) {
 	t.Parallel()
-	p := New(&nopDevice{})
+	p := New()
 	require.NotNil(t, p)
 
 	// open pollers should die when player is closed
@@ -161,7 +146,7 @@ func TestClose(t *testing.T) {
 	wg.Wait()
 
 	// attempts to enqueue into closed player should fail
-	err := p.Enqueue("", "fail to queue into closed player", nil)
+	err := p.Enqueue("fail to queue into closed player", nil, nil)
 	assert.Equal(t, ErrClosed, err, "enqueue should fail on a closed player")
 
 	// close as many times as you want
@@ -170,13 +155,12 @@ func TestClose(t *testing.T) {
 	assert.Equal(t, ErrClosed, p.Close())
 
 	// close should empty the queue and skip the currently playing song
-	p = New(&nopDevice{}, QueueLength(1))
+	p = New(QueueLength(1))
 	require.NotNil(t, p)
 	require.Empty(t, p.queue)
 
 	wg.Add(1)
-	err = p.Enqueue("", "pause and block playback", nopSongOpener,
-		PreEncoded(),
+	err = p.Enqueue("pause and block playback", nopSongOpener, nopDeviceWriter,
 		OnStart(func() {
 			p.Pause()
 		}),
@@ -191,7 +175,7 @@ func TestClose(t *testing.T) {
 	require.NoError(t, err)
 	wg.Wait()
 
-	err = p.Enqueue("", "", nil)
+	err = p.Enqueue("", nil, nil)
 	require.NoError(t, err)
 	require.Len(t, p.queue, 1)
 
@@ -214,7 +198,7 @@ func TestPlaylistAndClear(t *testing.T) {
 		"qux",
 	}
 	t.Parallel()
-	p := New(&nopDevice{}, QueueLength(len(songs)))
+	p := New(QueueLength(len(songs)))
 	require.NotNil(t, p)
 	defer p.Close()
 
@@ -223,8 +207,7 @@ func TestPlaylistAndClear(t *testing.T) {
 	songEnded := false
 	var wg sync.WaitGroup
 	wg.Add(1)
-	err := p.Enqueue("", "", nopSongOpener,
-		PreEncoded(),
+	err := p.Enqueue("", nopSongOpener, nopDeviceWriter,
 		OnStart(func() {
 			p.Pause()
 		}),
@@ -239,7 +222,7 @@ func TestPlaylistAndClear(t *testing.T) {
 
 	require.Empty(t, p.queue)
 	for idx, title := range songs {
-		err := p.Enqueue("", title, nil)
+		err := p.Enqueue(title, nil, nil)
 		require.NoErrorf(t, err, "failed to queue song %v:%v", idx, title)
 		assert.Equal(t, songs[0:idx+1], p.Playlist())
 	}
@@ -254,7 +237,7 @@ func TestPlaylistAndClear(t *testing.T) {
 
 	require.Empty(t, p.queue)
 	for idx, title := range songs {
-		err := p.Enqueue("", title, nil)
+		err := p.Enqueue("", nil, nil)
 		require.NoErrorf(t, err, "failed to queue song %v:%v", idx, title)
 		assert.Equal(t, songs[0:idx+1], p.Playlist())
 	}

@@ -1,7 +1,6 @@
 package player
 
 import (
-	"fmt"
 	"io"
 	"time"
 
@@ -9,83 +8,62 @@ import (
 	"github.com/pkg/errors"
 )
 
-func playback(player *Player, device Device) {
-	player.wg.Add(1)
+func (p *Player) playback() {
+	p.wg.Add(1)
 	// isIdle := pollTimeout == 0
-	pollTimeout := time.Duration(player.cfg.IdleTimeout) * time.Millisecond
+	pollTimeout := time.Duration(p.cfg.IdleTimeout) * time.Millisecond
 
 	for {
-		song, err := player.poll(pollTimeout)
+		song, err := p.poll(pollTimeout)
 		if err == errPollTimeout {
 			pollTimeout = 0
-			player.cfg.Idle()
+			p.cfg.Idle()
 			continue
 		} else if err != nil {
-			if wc, ok := player.writer.(io.Closer); ok {
+			if wc, ok := p.writer.(io.Closer); ok {
 				wc.Close()
 			}
-			player.wg.Done()
+			p.wg.Done()
 			return
 		}
-		pollTimeout = time.Duration(player.cfg.IdleTimeout) * time.Millisecond
+		pollTimeout = time.Duration(p.cfg.IdleTimeout) * time.Millisecond
 
-		player.wg.Add(1)
-		elapsed, err := openAndPlay(player, song, device)
+		p.wg.Add(1)
+		elapsed, err := p.openAndPlay(song)
 		song.onEnd(elapsed, err)
-		player.wg.Done()
+		p.wg.Done()
 	}
 }
 
-func openAndPlay(player *Player, song *songItem, device Device) (elapsed time.Duration, err error) {
-	var reader dca.OpusReader
-	var writer io.Writer
-
-	// TODO consider how to manage closing abstract writers and not just discord voice channels
-	writer, err = device.Open(song.channelID)
+func (p *Player) openAndPlay(song *songItem) (elapsed time.Duration, err error) {
+	writer, err := song.openDst()
 	if err != nil {
-		err = errors.Wrap(err, "failed to join song channel")
+		err = errors.Wrap(err, "failed to open device")
 		return
 	}
 
 	// keep track of the open writer so it can get closed when the player closes if is a closer
-	player.writer = writer
+	p.writer = writer
 
-	rc, err := song.open()
+	reader, err := song.openSrc()
 	if err != nil {
 		err = errors.Wrap(err, "failed to open song")
 		return
 	}
-	if rc, ok := rc.(io.Closer); ok {
+	if rc, ok := reader.(io.Closer); ok {
 		defer rc.Close()
 	}
 
-	if song.preencoded {
-		reader = dca.NewDecoder(rc)
-	} else {
-		opts := defaultEncodeOptions
-		opts.AudioFilter = song.filters
-		if song.loudness != 0 {
-			if opts.AudioFilter != "" {
-				opts.AudioFilter += ", "
-			}
-			opts.AudioFilter += fmt.Sprintf("loudnorm=i=%.1f", song.loudness)
-		}
-
-		var enc *dca.EncodeSession
-		enc, err = dca.EncodeMem(rc, &opts)
-		if err != nil {
-			err = errors.Wrap(err, "failed to start encoder")
-			return
-		}
-		defer enc.Cleanup()
-		reader = enc
+	src, err := song.encoder(reader)
+	if err != nil {
+		return
 	}
 
-	elapsed, err = play(player, reader, writer, song.callbacks)
+	elapsed, err = play(p, src, writer, song.callbacks)
 	return
 }
 
-func play(player *Player, src dca.OpusReader, dst io.Writer, cb callbacks) (elapsed time.Duration, err error) {
+func play(player *Player, src Source, dst io.Writer, cb callbacks) (elapsed time.Duration, err error) {
 	var frame []byte
 	nWrites, frameDur := 0, src.FrameDuration()
 
@@ -101,7 +79,7 @@ func play(player *Player, src dca.OpusReader, dst io.Writer, cb callbacks) (elap
 	drain(player.ctrl)
 
 	// gate reads and writes in order to respect and pause/skip signals
-	ticker := time.NewTicker(frameDur / 2)
+	ticker := time.NewTicker(1)
 	defer ticker.Stop()
 	// playing if ready == ticker, paused if ready == nil
 	ready := ticker.C
@@ -127,7 +105,7 @@ func play(player *Player, src dca.OpusReader, dst io.Writer, cb callbacks) (elap
 				}
 			}
 		case <-ready:
-			frame, err = src.OpusFrame()
+			frame, err = src.ReadFrame()
 			if err != nil {
 				err = errors.Wrap(err, "failed to read frame")
 				// include some extra debug info if failed well before we should have
