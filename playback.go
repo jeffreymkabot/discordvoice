@@ -45,18 +45,13 @@ func (p *Player) openAndPlay(song *songItem) (elapsed time.Duration, err error) 
 	// keep track of the open writer so it can get closed when the player closes if is a closer
 	p.writer = writer
 
-	reader, err := song.openSrc()
+	src, err := song.openSrc()
 	if err != nil {
 		err = errors.Wrap(err, "failed to open song")
 		return
 	}
-	if rc, ok := reader.(io.Closer); ok {
+	if rc, ok := src.(io.Closer); ok {
 		defer rc.Close()
-	}
-
-	src, err := song.encoder(reader)
-	if err != nil {
-		return
 	}
 
 	elapsed, err = play(p, src, writer, song.callbacks)

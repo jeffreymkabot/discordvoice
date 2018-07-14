@@ -6,52 +6,23 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/require"
-
-	mp3 "github.com/hajimehoshi/go-mp3"
 	"github.com/hajimehoshi/oto"
 	"github.com/jeffreymkabot/discordvoice"
+	"github.com/jeffreymkabot/discordvoice/mp3"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
-
-// go-mp3 constants
-const (
-	bytesPerSample = 4
-	// from github.com/hajimehoshi/go-mp3/internal/consts
-	bytesPerFrame = 4608
-)
-
-type mp3Source struct {
-	decoder *mp3.Decoder
-}
-
-func (src mp3Source) ReadFrame() (frame []byte, err error) {
-	frame = make([]byte, bytesPerFrame)
-	nr, err := src.decoder.Read(frame)
-	frame = frame[0:nr]
-	return
-}
-
-func (src mp3Source) FrameDuration() time.Duration {
-	bytesPerSecond := bytesPerSample * src.decoder.SampleRate()
-	secondsPerFrame := float64(bytesPerFrame) / float64(bytesPerSecond)
-	return time.Duration(secondsPerFrame * float64(time.Second))
-}
 
 func TestPlayback(t *testing.T) {
-	p := player.New()
-	defer p.Close()
+	t.Parallel()
 
-	openSong := func() (io.Reader, error) {
-		return os.Open("test.mp3")
-	}
-	encodeSong := func(r io.Reader) (player.Source, error) {
-		decoder, err := mp3.NewDecoder(r.(io.ReadCloser))
+	openSource := func() (player.Source, error) {
+		f, err := os.Open("media/test_file.mp3")
 		if err != nil {
 			return nil, err
 		}
-		return mp3Source{decoder: decoder}, nil
+		return mp3.NewSource(f)
 	}
 
 	bufferSize := 1 << 15
@@ -60,13 +31,16 @@ func TestPlayback(t *testing.T) {
 	}
 
 	end := make(chan struct{})
-	p.Enqueue("test", openSong, openDevice,
-		player.Encoder(encodeSong),
+
+	p := player.New()
+	defer p.Close()
+	p.Enqueue("test", openSource, openDevice,
 		player.OnStart(func() {
 			t.Log("playback started")
 		}),
 		player.OnEnd(func(e time.Duration, err error) {
-			t.Logf("playback stopped after %v because %v", e, err)
+			t.Logf("playback stopped after %v seconds because %v", e.Seconds(), err)
+			assert.InDelta(t, 21, e.Seconds(), 0.5, "expected elapsed to be roughly 21 seconds")
 			assert.Equal(t, errors.Cause(err), io.EOF, "expected playback to end because of EOF")
 			close(end)
 		}),
@@ -74,7 +48,7 @@ func TestPlayback(t *testing.T) {
 
 	select {
 	case <-end:
-	case <-time.After(5 * time.Second):
-		require.FailNow(t, "timeout after 5 seconds")
+	case <-time.After(25 * time.Second):
+		require.FailNow(t, "timeout after 25 seconds")
 	}
 }

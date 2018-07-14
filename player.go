@@ -44,11 +44,9 @@ type Player struct {
 // If the writer also implements io.Closer it will be closed when the player is closed.
 type DeviceOpenerFunc func() (io.Writer, error)
 
-// SongOpenerFunc opens an audio stream.
-// If the reader also implements io.Closer it will be closed after playback.
-type SongOpenerFunc func() (io.Reader, error)
-
-type EncodeFunc func(io.Reader) (Source, error)
+// SourceOpenerFunc opens an audio stream.
+// If the source also implements io.Closer it will be closed after playback.
+type SourceOpenerFunc func() (Source, error)
 
 type Source interface {
 	ReadFrame() ([]byte, error)
@@ -61,11 +59,10 @@ type SourceCloser interface {
 }
 
 type songItem struct {
-	openSrc SongOpenerFunc
+	openSrc SourceOpenerFunc
 	openDst DeviceOpenerFunc
 	title   string
 
-	encoder  EncodeFunc
 	loudness float64
 	filters  string
 	callbacks
@@ -108,7 +105,7 @@ func New(opts ...Option) *Player {
 }
 
 // Enqueue puts an item at the end of the queue.
-func (p *Player) Enqueue(title string, openSrc SongOpenerFunc, openDst DeviceOpenerFunc, opts ...SongOption) error {
+func (p *Player) Enqueue(title string, openSrc SourceOpenerFunc, openDst DeviceOpenerFunc, opts ...SongOption) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	select {

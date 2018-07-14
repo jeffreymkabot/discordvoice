@@ -28,7 +28,7 @@ func New(discord *discordgo.Session, guildID string, sendTimeout time.Duration) 
 	}
 }
 
-// Open implements the player.Device interface.
+// Open produces an io.Writer interface for sending audio frames to a discord voice channel.
 // Open will recycle the previous Writer if it is still open to the same channel.
 func (d *Device) Open(channelID string) (io.Writer, error) {
 	if !ValidVoiceChannel(d.discord, channelID) {

@@ -13,12 +13,25 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-var nopDeviceWriter = func() (io.Writer, error) {
+var nopDeviceOpener = func() (io.Writer, error) {
 	return ioutil.Discard, nil
 }
 
-var nopSongOpener SongOpenerFunc = func() (io.Reader, error) {
-	return strings.NewReader("hello world"), nil
+var nopSongOpener SourceOpenerFunc = func() (Source, error) {
+	return &stringSource{strings.NewReader("hello world")}, nil
+}
+
+type stringSource struct {
+	*strings.Reader
+}
+
+func (s *stringSource) ReadFrame() ([]byte, error) {
+	b, err := s.ReadByte()
+	return []byte{b}, err
+}
+
+func (s *stringSource) FrameDuration() time.Duration {
+	return 1 * time.Second
 }
 
 func TestEnqueuePoll(t *testing.T) {
@@ -41,7 +54,7 @@ func TestEnqueuePoll(t *testing.T) {
 	// wait for it to be paused
 	var waitForPause sync.WaitGroup
 	waitForPause.Add(1)
-	err := p.Enqueue(pauseAndBlock, nopSongOpener, nopDeviceWriter,
+	err := p.Enqueue(pauseAndBlock, nopSongOpener, nopDeviceOpener,
 		OnStart(func() {
 			p.Pause()
 		}),
@@ -160,7 +173,7 @@ func TestClose(t *testing.T) {
 	require.Empty(t, p.queue)
 
 	wg.Add(1)
-	err = p.Enqueue("pause and block playback", nopSongOpener, nopDeviceWriter,
+	err = p.Enqueue("pause and block playback", nopSongOpener, nopDeviceOpener,
 		OnStart(func() {
 			p.Pause()
 		}),
@@ -207,7 +220,7 @@ func TestPlaylistAndClear(t *testing.T) {
 	songEnded := false
 	var wg sync.WaitGroup
 	wg.Add(1)
-	err := p.Enqueue("", nopSongOpener, nopDeviceWriter,
+	err := p.Enqueue("", nopSongOpener, nopDeviceOpener,
 		OnStart(func() {
 			p.Pause()
 		}),
@@ -237,7 +250,7 @@ func TestPlaylistAndClear(t *testing.T) {
 
 	require.Empty(t, p.queue)
 	for idx, title := range songs {
-		err := p.Enqueue("", nil, nil)
+		err := p.Enqueue(title, nil, nil)
 		require.NoErrorf(t, err, "failed to queue song %v:%v", idx, title)
 		assert.Equal(t, songs[0:idx+1], p.Playlist())
 	}

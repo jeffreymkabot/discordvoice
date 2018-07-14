@@ -14,12 +14,25 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-var nopDeviceWriter = func() (io.Writer, error) {
+var nopDeviceOpener = func() (io.Writer, error) {
 	return ioutil.Discard, nil
 }
 
-var nopSongOpener player.SongOpenerFunc = func() (io.Reader, error) {
-	return strings.NewReader("hello world"), nil
+var nopSongOpener player.SourceOpenerFunc = func() (player.Source, error) {
+	return &stringSource{strings.NewReader("hello world")}, nil
+}
+
+type stringSource struct {
+	*strings.Reader
+}
+
+func (s *stringSource) ReadFrame() ([]byte, error) {
+	b, err := s.ReadByte()
+	return []byte{b}, err
+}
+
+func (s *stringSource) FrameDuration() time.Duration {
+	return 1 * time.Second
 }
 
 func TestNewPlayer(t *testing.T) {
@@ -48,7 +61,7 @@ func TestCallbacks(t *testing.T) {
 	var pauseTime time.Duration
 	var resumeTime time.Duration
 	var endErr error
-	err := p.Enqueue("", nopSongOpener, nopDeviceWriter,
+	err := p.Enqueue("", nopSongOpener, nopDeviceOpener,
 		player.OnStart(func() {
 			calledOnStart = true
 			p.Pause()
@@ -102,7 +115,7 @@ func TestSkip(t *testing.T) {
 	var waitForEnd sync.WaitGroup
 	waitForPause.Add(1)
 	waitForEnd.Add(1)
-	err := p.Enqueue("", nopSongOpener, nopDeviceWriter,
+	err := p.Enqueue("", nopSongOpener, nopDeviceOpener,
 		player.OnStart(func() {
 			p.Pause()
 		}),
