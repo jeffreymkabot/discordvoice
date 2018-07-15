@@ -6,3 +6,8 @@ go:
 
 script:
   - go test -v -race ./...
+
+addons:
+  apt:
+    packages:
+      - libasound2-dev
