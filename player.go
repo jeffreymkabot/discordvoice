@@ -10,7 +10,7 @@ import (
 )
 
 // Version follows semantic versioning.
-const Version = "0.4.1"
+const Version = "0.5.0"
 
 // Player errors
 var (
