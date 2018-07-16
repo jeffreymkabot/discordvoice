@@ -8,28 +8,35 @@ import (
 	"github.com/jonas747/dca"
 )
 
-type Source struct {
+// SourceCloser provides a source of opus frames suitable for a discord voice channel.
+type SourceCloser struct {
 	r   io.Reader
 	enc *dca.EncodeSession
 }
 
-func NewSource(r io.Reader, opts *dca.EncodeOptions) (*Source, error) {
+// NewSource produces a source of opus frames suitable for a discord voice channel.
+// The opus encoder requires ffmpeg available in the PATH.
+// If the reader implements io.Closer the reader will be closed when the source is closed.
+func NewSource(r io.Reader, opts *dca.EncodeOptions) (*SourceCloser, error) {
 	enc, err := dca.EncodeMem(r, opts)
 	if err != nil {
 		return nil, err
 	}
-	return &Source{r: r, enc: enc}, nil
+	return &SourceCloser{r: r, enc: enc}, nil
 }
 
-func (s *Source) ReadFrame() ([]byte, error) {
+// ReadFrame implements player.SourceCloser.
+func (s *SourceCloser) ReadFrame() ([]byte, error) {
 	return s.enc.OpusFrame()
 }
 
-func (s *Source) FrameDuration() time.Duration {
+// FrameDuration implements player.SourceCloser.
+func (s *SourceCloser) FrameDuration() time.Duration {
 	return s.enc.FrameDuration()
 }
 
-func (s *Source) Close() error {
+// Close implements player.SourceCloser.
+func (s *SourceCloser) Close() error {
 	s.enc.Cleanup()
 	if rc, ok := s.r.(io.Closer); ok {
 		return rc.Close()
@@ -37,4 +44,5 @@ func (s *Source) Close() error {
 	return nil
 }
 
-var _ player.SourceCloser = &Source{}
+// do no compile unless SourceCloser implements player.SourceCloser.
+var _ player.SourceCloser = &SourceCloser{}

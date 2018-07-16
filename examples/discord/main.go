@@ -29,6 +29,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer session.Close()
 
 	device := discordvoice.New(session, *guildID, 1*time.Second)
 	openDevice := func() (io.Writer, error) {

@@ -16,11 +16,14 @@ const (
 	bytesPerFrame = 4608
 )
 
-type MP3Source struct {
+// SourceCloser provides a source of decoded PCM frames from an mp3.
+type SourceCloser struct {
 	decoder *mp3.Decoder
 }
 
-func NewSource(r io.Reader) (*MP3Source, error) {
+// NewSource produces a source of decoded PCM frames from an mp3.
+// If the reader implements io.Closer the reader will be closed when the source is closed.
+func NewSource(r io.Reader) (*SourceCloser, error) {
 	rc, ok := r.(io.ReadCloser)
 	if !ok {
 		rc = ioutil.NopCloser(r)
@@ -31,25 +34,29 @@ func NewSource(r io.Reader) (*MP3Source, error) {
 		return nil, err
 	}
 
-	return &MP3Source{decoder: dec}, nil
+	return &SourceCloser{decoder: dec}, nil
 }
 
-func (src *MP3Source) ReadFrame() (frame []byte, err error) {
+// ReadFrame implements player.SourceCloser.
+func (src *SourceCloser) ReadFrame() (frame []byte, err error) {
 	frame = make([]byte, bytesPerFrame)
 	nr, err := src.decoder.Read(frame)
 	frame = frame[0:nr]
 	return
 }
 
-func (src *MP3Source) FrameDuration() time.Duration {
+// FrameDuration implements player.SourceCloser.
+func (src *SourceCloser) FrameDuration() time.Duration {
 	bytesPerSecond := bytesPerSample * src.decoder.SampleRate()
 	secondsPerFrame := float64(bytesPerFrame) / float64(bytesPerSecond)
 	return time.Duration(secondsPerFrame * float64(time.Second))
 }
 
-func (src *MP3Source) Close() error {
+// Close implements player.SourceCloser.
+func (src *SourceCloser) Close() error {
 	// go-mp3 calls close on the underlying reader
 	return src.decoder.Close()
 }
 
-var _ player.SourceCloser = &MP3Source{}
+// do not compile unless SourceCloser implements player.SourceCloser
+var _ player.SourceCloser = &SourceCloser{}
