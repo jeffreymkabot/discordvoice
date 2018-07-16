@@ -10,7 +10,7 @@ import (
 )
 
 // Version follows semantic versioning.
-const Version = "0.5.0"
+const Version = "0.5.1"
 
 // Player errors
 var (
@@ -62,9 +62,6 @@ type songItem struct {
 	openSrc SourceOpenerFunc
 	openDst DeviceOpenerFunc
 	title   string
-
-	loudness float64
-	filters  string
 	callbacks
 }
 

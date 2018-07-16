@@ -34,22 +34,6 @@ func IdleFunc(idle func(), d int) Option {
 // Pass SongOptions to the Player.Enqueue function.
 type SongOption func(*songItem)
 
-// Filter sets the ffmpeg audio filter string.  Filter has no effect if the item is PreEncoded.
-func Filter(af string) SongOption {
-	return func(s *songItem) {
-		s.filters = af
-	}
-}
-
-// Loudness sets the encoder's loudness target.
-// Use values between -70.0 and -5.0.  Higher is louder.
-// See https://ffmpeg.org/ffmpeg-filters.html#loudnorm.
-func Loudness(f float64) SongOption {
-	return func(s *songItem) {
-		s.loudness = f
-	}
-}
-
 // Duration lets the player know how long it should expect the item's playback to be.
 func Duration(d time.Duration) SongOption {
 	return func(s *songItem) {
