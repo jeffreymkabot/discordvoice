@@ -2,6 +2,7 @@ package discordvoice
 
 import (
 	"io"
+	"log"
 	"sync"
 	"time"
 
@@ -10,6 +11,8 @@ import (
 )
 
 var ErrInvalidVoiceChannel = errors.New("invalid voice channel")
+
+const initRetries = 3
 
 // Device
 type Device struct {
@@ -35,11 +38,13 @@ func (d *Device) Open(channelID string) (io.Writer, error) {
 		return nil, ErrInvalidVoiceChannel
 	}
 	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.writer == nil || d.writer.channelID != channelID || !d.writer.Ready() {
+	if d.writer != nil && d.writer.channelID != channelID {
+		d.writer.Close()
+		d.writer = nil
+	}
+	if d.writer == nil {
 		vconn, err := d.discord.ChannelVoiceJoin(d.guildID, channelID, false, true)
 		if err != nil {
-			d.writer = nil
 			return nil, errors.Wrap(err, "failed to join discord channel")
 		}
 		d.writer = &Writer{
@@ -50,6 +55,7 @@ func (d *Device) Open(channelID string) (io.Writer, error) {
 			vconn:       vconn,
 		}
 	}
+	defer d.mu.Unlock()
 	d.writer.vconn.Speaking(true)
 	return d.writer, nil
 }
@@ -60,60 +66,42 @@ type Writer struct {
 	channelID   string
 	sendTimeout time.Duration
 	discord     *discordgo.Session
-	mu          sync.Mutex
 	vconn       *discordgo.VoiceConnection
-}
-
-func (w *Writer) Ready() bool {
-	w.vconn.RWMutex.RLock()
-	defer w.vconn.RWMutex.RUnlock()
-	return w.ready()
-}
-
-// check that the channel hasn't changed under our nose
-// e.g. websocket error or a user dragging us into a different channel?
-func (w *Writer) ready() bool {
-	return w.vconn.ChannelID == w.channelID && w.vconn.Ready
 }
 
 // TODO writer intelligently calls vconn.Speaking(true/false) before/after writing
 func (w *Writer) Write(p []byte) (n int, err error) {
-	if !w.Ready() {
-		// TODO attempt reconnect, could just skip checking ready and let the channel send timeout
-		err = errors.New("voice connection closed")
-		return
-	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.write(p, true)
+	return w.tryWrite(p, initRetries)
 }
 
-func (w *Writer) write(p []byte, retryOnTimeout bool) (n int, err error) {
+// TODO provide a way to break out of retry loop when player gets closed
+func (w *Writer) tryWrite(p []byte, retries int) (n int, err error) {
 	select {
 	case w.vconn.OpusSend <- p:
 		return len(p), nil
 	case <-time.After(w.sendTimeout):
-		if !retryOnTimeout {
-			err = errors.Errorf("send timeout on voice connection after %v", w.sendTimeout)
+		if retries <= 0 {
+			err = errors.New("failed to write to voice connection")
 			return 0, err
 		}
-		vconn, err := w.reconnect()
+		log.Printf("send timeout, reconnecting, retries left: %v", retries)
+		w.Close()
+		time.Sleep(1 * time.Second)
+		vconn, err := w.discord.ChannelVoiceJoin(w.guildID, w.channelID, false, true)
 		if err != nil {
-			return 0, err
+			return 0, errors.Wrap(err, "failed to join discord channel")
 		}
 		w.vconn = vconn
-		return w.write(p, false)
+		w.vconn.Speaking(true)
+		return w.tryWrite(p, retries-1)
 	}
-}
-
-func (w *Writer) reconnect() (*discordgo.VoiceConnection, error) {
-	w.vconn.Disconnect()
-	return w.discord.ChannelVoiceJoin(w.guildID, w.channelID, false, true)
 }
 
 func (w *Writer) Close() error {
 	w.vconn.Speaking(false)
-	return w.vconn.Disconnect()
+	err := w.vconn.Disconnect()
+	w.vconn = nil
+	return err
 }
 
 func ValidVoiceChannel(discord *discordgo.Session, channelID string) bool {
